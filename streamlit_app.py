@@ -106,7 +106,7 @@ def read_lock_state(ws, sheet_row: int):
         "deadline": get_col("X"),
         "token":    get_col("Y"),
         "started":  get_col("Z"),
-        "window":   get_col("AA"),
+        "window":   get_col("AA"),  # AA is immediately after Z
     }
 
 def write_lock_state(ws, sheet_row: int, start_iso: str, deadline_iso: str, token: str):
@@ -116,7 +116,8 @@ def write_lock_state(ws, sheet_row: int, start_iso: str, deadline_iso: str, toke
             {"range": f"{ws.title}!W{sheet_row}", "values": [[start_iso]]},
             {"range": f"{ws.title}!X{sheet_row}", "values": [[deadline_iso]]},
             {"range": f"{ws.title}!Y{sheet_row}", "values": [[token]]},
-            {"range": f"{ws.title}!Z{sheet_row}", "values": [["0"]]},
+            {"range": f"{ws.title}!Z{sheet_row}", "values": [["0"]]},  # TreatmentStarted reset
+            # AA (WindowSec) user-managed per row; not written here
         ]
     })
 
