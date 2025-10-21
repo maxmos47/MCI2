@@ -700,7 +700,7 @@ else:
             idx2 = ALLOWED_V.index(current_V2) if current_V2 in ALLOWED_V else 0
             with st.form("form_v_inline"):
                 v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2)
-                v_submitted = st.form_submit_button("Submit Treatment")
+                v_submitted = st.form_submit_button("Submit Triage")
 
             if v_submitted:
                 try:
