@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-import requests  # เรียก GAS
+import requests  # เรียก GAS (Primary timer)
 
 st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
@@ -20,6 +20,19 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# =========================
+# Session flags (timer / expiry)
+# =========================
+if "next_after_lq" not in st.session_state:
+    st.session_state["next_after_lq"] = None
+if "timer_stopped" not in st.session_state:
+    st.session_state["timer_stopped"] = False  # หยุดแล้ว (จาก submit หรือหมดเวลา)
+if "expired_processed" not in st.session_state:
+    st.session_state["expired_processed"] = False  # กันเพิ่ม Z ซ้ำ
+
+# =========================
+# Helpers: Google Sheets client
+# =========================
 def get_gs_client():
     if "gcp_service_account" not in st.secrets:
         st.error("Missing [gcp_service_account] in secrets.toml")
@@ -55,21 +68,8 @@ def open_ws():
         st.stop()
     return ws
 
-ALLOWED_V = ["Priority 1", "Priority 2", "Priority 3"]
-YN = ["Yes", "No"]
-
-# Keep phase-2 payload after L–Q submit (avoid extra reload)
-if "next_after_lq" not in st.session_state:
-    st.session_state["next_after_lq"] = None
-
-# Timer state flags
-if "timer_stopped" not in st.session_state:
-    st.session_state["timer_stopped"] = False  # หยุดนับเพราะ submit/หมดเวลา
-if "expired_processed" not in st.session_state:
-    st.session_state["expired_processed"] = False  # กันเพิ่ม Z ซ้ำ
-
 # =========================
-# Helpers for query params
+# Query params (row / mode)
 # =========================
 def get_query_params() -> Dict[str, str]:
     try:
@@ -85,11 +85,23 @@ def set_query_params(**kwargs):
     except Exception:
         st.experimental_set_query_params(**kwargs)
 
+qp = get_query_params()
+display_row_str = qp.get("row", "1")
+mode = qp.get("mode", "edit1")  # "edit1" A–K + L–Q, "edit2" R–U + V, "view" A–C + R–V
+
+try:
+    display_row = int(display_row_str)
+    if display_row < 1:
+        display_row = 1
+except ValueError:
+    display_row = 1
+
+sheet_row = display_row + 1  # header อยู่บรรทัด 1
+
 # =========================
 # Utility: column helpers
 # =========================
 def col_letter_to_index(letter: str) -> int:
-    """A -> 1, B -> 2, ..."""
     letter = letter.upper()
     result = 0
     for ch in letter:
@@ -97,7 +109,6 @@ def col_letter_to_index(letter: str) -> int:
     return result
 
 def index_to_col_letter(idx: int) -> str:
-    """1 -> A, 2 -> B, ..."""
     letters = ""
     while idx > 0:
         idx, rem = divmod(idx - 1, 26)
@@ -105,10 +116,9 @@ def index_to_col_letter(idx: int) -> str:
     return letters
 
 # =========================
-# Sheets data access layer
+# Data access (rows / updates)
 # =========================
 def get_header_and_row(ws, row: int) -> Tuple[List[str], List[str]]:
-    """Return (headers, values) where headers are row 1 and values are row N."""
     headers = ws.row_values(1)
     vals = ws.row_values(row)
     if len(vals) < len(headers):
@@ -116,13 +126,16 @@ def get_header_and_row(ws, row: int) -> Tuple[List[str], List[str]]:
     return headers, vals
 
 def slice_dict_by_cols(headers: List[str], vals: List[str], start_col: str, end_col: str) -> Dict[str, str]:
-    s = col_letter_to_index(start_col) - 1  # 0-based
+    s = col_letter_to_index(start_col) - 1
     e = col_letter_to_index(end_col) - 1
     out = {}
     for i in range(s, e + 1):
         if i < len(headers):
             out[headers[i]] = vals[i] if i < len(vals) else ""
     return out
+
+ALLOWED_V = ["Priority 1", "Priority 2", "Priority 3"]
+YN = ["Yes", "No"]
 
 def build_payloads_from_row(ws, sheet_row: int, mode: str) -> Dict:
     headers, vals = get_header_and_row(ws, sheet_row)
@@ -131,9 +144,12 @@ def build_payloads_from_row(ws, sheet_row: int, mode: str) -> Dict:
     LQ_dict = slice_dict_by_cols(headers, vals, "L", "Q")
     headers_LQ = list(LQ_dict.keys())
     current_LQ = [LQ_dict[h] if LQ_dict[h] in YN else ("Yes" if str(LQ_dict[h]).strip().lower() == "yes" else "No") for h in headers_LQ]
+
     RU = slice_dict_by_cols(headers, vals, "R", "U")
+
     Vcol_idx = col_letter_to_index("V") - 1
     current_V = vals[Vcol_idx] if Vcol_idx < len(vals) else ""
+
     AC = slice_dict_by_cols(headers, vals, "A", "C")
     A_C_R_U = {**AC, **RU}
     RV = slice_dict_by_cols(headers, vals, "R", "V")
@@ -144,10 +160,10 @@ def build_payloads_from_row(ws, sheet_row: int, mode: str) -> Dict:
         data["A_K"] = AK
         data["headers_LQ"] = headers_LQ
         data["current_LQ"] = current_LQ
-    elif mode == "edit2":
+    if mode == "edit2":
         data["A_C_R_U"] = A_C_R_U
         data["current_V"] = current_V
-    elif mode == "view":
+    if mode == "view":
         data["A_C_R_V"] = A_C_R_V
     return data
 
@@ -174,11 +190,11 @@ def update_V(ws, sheet_row: int, v_value: str) -> Dict:
     return {"status": "ok", "final": {"A_C_R_V": {**AC, **RV}}}
 
 def increment_Z(ws, sheet_row: int) -> int:
-    """เพิ่มค่า 1 ที่คอลัมน์ Z (ตัวเลข), คืนค่าหลังอัปเดต"""
+    """Z = Z + 1"""
     Z_idx = col_letter_to_index("Z")
-    cell = f"{index_to_col_letter(Z_idx)}{sheet_row}"
+    a1 = f"{index_to_col_letter(Z_idx)}{sheet_row}"
     try:
-        cur = ws.acell(cell).value
+        cur = ws.acell(a1).value
     except Exception:
         cur = ""
     try:
@@ -186,11 +202,11 @@ def increment_Z(ws, sheet_row: int) -> int:
     except Exception:
         base = 0
     new_val = base + 1
-    ws.update_acell(cell, new_val)
+    ws.update_acell(a1, new_val)
     return new_val
 
 # =========================
-# Card UI (mobile-friendly)
+# Card UI
 # =========================
 st.markdown("""
 <style>
@@ -235,7 +251,7 @@ def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
                 )
 
 # =========================
-# GAS helpers (ใช้ข้อมูลเวลาเดียวกับ Primary)
+# GAS helpers (Primary timer)
 # =========================
 def gas_get_row(row: int) -> dict:
     url = st.secrets.get("gas", {}).get("webapp_url", "")
@@ -266,7 +282,7 @@ def gas_start_timer(row: int) -> dict:
     return r.json()
 
 def gas_stop_timer(row: int) -> dict:
-    """ถ้ามี endpoint stop_timer จะหยุดที่ต้นทางด้วย; ถ้าไม่มีจะไม่ error"""
+    """หยุดที่ต้นทาง (ถ้ามี endpoint stop_timer); ถ้าไม่มีจะไม่ error"""
     url = st.secrets.get("gas", {}).get("webapp_url", "")
     if not url:
         return {}
@@ -282,10 +298,10 @@ def gas_stop_timer(row: int) -> dict:
         return {"status": "noop"}
 
 # =========================
-# Timer helpers (fallback อ่านจากชีท Secondary ถ้าไม่มี GAS)
+# Timer helpers (fallback อ่านจาก Secondary ถ้าไม่มี GAS)
 # =========================
 def parse_seconds(value) -> int:
-    """รองรับ: 120, '120', '02:00', '00:01:30' และ numeric day-fraction ของ Google Sheets"""
+    """รองรับ: 120, '02:00', '00:01:30', และ numeric day-fraction"""
     try:
         if value is None or value == "":
             return 0
@@ -310,7 +326,6 @@ def parse_seconds(value) -> int:
     return 0
 
 def read_timer_state(ws, sheet_row: int) -> dict:
-    """อ่าน Q/R/S ของแถวนั้น: คืน {origin, t0_epoch, end_epoch} (int ทั้งหมด)"""
     headers, vals = get_header_and_row(ws, sheet_row)
     q_idx = col_letter_to_index("Q") - 1
     r_idx = col_letter_to_index("R") - 1
@@ -333,7 +348,6 @@ def read_timer_state(ws, sheet_row: int) -> dict:
     return {"origin": origin, "t0_epoch": t0_epoch, "end_epoch": end_epoch}
 
 def start_timer_if_needed(ws, sheet_row: int, origin: int, t0_epoch: int, end_epoch: int) -> Tuple[int, int]:
-    """ตั้งค่า R/S ครั้งแรก (idempotent) บนชีท Secondary (fallback เท่านั้น)"""
     if origin <= 0:
         return t0_epoch, end_epoch
     if t0_epoch > 0 and end_epoch > 0:
@@ -354,29 +368,16 @@ def start_timer_if_needed(ws, sheet_row: int, origin: int, t0_epoch: int, end_ep
     })
     return t0, end_
 
-def fmt_hms(secs: int) -> str:
-    secs = max(0, int(secs))
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
 def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
-    """
-    โชว์ตัวเลข HH:MM:SS + progress; ถ้า paused=True จะไม่แสดงกล่อง (ซ่อนทันที)
-    ระหว่างนับ: เมื่อถึง 0 จะซ่อนและ reload หน้าอัตโนมัติ
-    """
+    """โชว์นับถอยหลัง; เมื่อถึง 0 → ซ่อนและ reload หน้า, paused=True → ไม่วาดอะไร (ซ่อน)"""
     import streamlit.components.v1 as components
-
     if paused:
-        # ซ่อนกล่องไปเลยเมื่อหยุด/หมดเวลา
         return
-
     def _fmt(secs: int) -> str:
         secs = max(0, int(secs))
         h, rem = divmod(secs, 3600)
         m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
-
     initial_digits = _fmt(remaining)
     progress_value = max(0, (origin_seconds - remaining) if origin_seconds else 0)
     progress_max = max(1, origin_seconds if origin_seconds > 0 else 1)
@@ -416,8 +417,8 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
                 remaining = 0;
                 render();
                 clearInterval(intv);
-                if (wrap) wrap.style.display = 'none'; // ซ่อน
-                setTimeout(() => window.location.reload(), 50); // รีเฟรชหน้า
+                if (wrap) wrap.style.display = 'none';
+                setTimeout(() => window.location.reload(), 50);
                 return;
               }}
               render();
@@ -428,42 +429,55 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
         height=160,
     )
 
+def show_lock_overlay(message: str = "คนไข้เสียชีวิตแล้ว"):
+    st.markdown(
+        f"""
+        <style>
+        .lock-overlay {{
+          position: fixed; inset: 0;
+          background: rgba(2,6,23,.65);
+          z-index: 99999;
+          display: flex; align-items: center; justify-content: center;
+          backdrop-filter: blur(2px);
+        }}
+        .lock-card {{
+          background: #fff; color:#111827;
+          padding: 24px 28px; border-radius: 16px;
+          box-shadow: 0 10px 30px rgba(0,0,0,.25);
+          max-width: 90vw; text-align:center;
+        }}
+        .lock-card h2 {{ margin: 0 0 8px 0; font-size: 1.6rem; }}
+        .lock-card p {{ margin: 0; font-size: 1rem; color:#4b5563; }}
+        </style>
+        <div class="lock-overlay">
+          <div class="lock-card">
+            <h2>⛔ {message}</h2>
+            <p>ฟอร์มถูกล็อกแล้ว ไม่สามารถแก้ไขได้</p>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 # =========================
-# Main UI
+# Main
 # =========================
 st.markdown("### 🩺 Patient Information")
-
-qp = get_query_params()
-display_row_str = qp.get("row", "1")
-mode = qp.get("mode", "edit1")  # edit1 -> L–Q; edit2 -> V; view -> final
-
-# Interpret URL row=1 as sheet row 2 (headers at row 1)
-try:
-    display_row = int(display_row_str)
-    if display_row < 1:
-        display_row = 1
-except ValueError:
-    display_row = 1
-
-sheet_row = display_row + 1  # shift by 1 so that "row=1" targets sheet row 2
-
 ws = open_ws()
 has_inline_phase2 = st.session_state["next_after_lq"] is not None
 
-# ---------- TIMER (ใช้ GAS เป็นหลัก; fallback ชีท Secondary) ----------
+# ---------- TIMER (GAS เป็นหลัก; fallback Secondary) ----------
 origin_seconds = 0
 t0_epoch = 0
 end_epoch = 0
 
-# 1) พยายามอ่านจาก GAS (ชีท Primary)
+# 1) GAS
 try:
     g = gas_get_row(row=display_row)
     if g and g.get("status") == "ok":
         origin_seconds = int(g.get("timer_seconds", 0) or 0)
         t0_epoch = int(g.get("t0_epoch", 0) or 0)
         end_epoch = int(g.get("end_epoch", 0) or 0)
-
-        # ถ้า Q>0 แต่ยังไม่ set R/S → เริ่มที่ GAS (idempotent)
         if origin_seconds > 0 and end_epoch == 0:
             s = gas_start_timer(row=display_row)
             if s.get("status") == "ok":
@@ -472,7 +486,7 @@ try:
 except Exception as e:
     st.warning(f"GAS error, fallback to sheet: {e}")
 
-# 2) ถ้ายังไม่มี end_epoch จาก GAS → fallback: อ่านจากชีท Secondary
+# 2) fallback Secondary
 if end_epoch == 0:
     try:
         ts = read_timer_state(ws, sheet_row)
@@ -488,24 +502,29 @@ if end_epoch == 0:
 now = int(pd.Timestamp.utcnow().timestamp())
 remaining = max(0, end_epoch - now) if end_epoch else 0
 
-# ===== ถ้าหมดเวลา แล้วยังไม่เคยประมวลผล → เพิ่ม Z + ล็อก + รีเฟรชทันที =====
+# ===== หมดเวลา → เพิ่ม Z + ล็อก + rerun (ให้รอบถัดไป lock ทั้งหน้าและเอาปุ่มออก) =====
 if (remaining <= 0) and (not st.session_state["expired_processed"]):
     try:
-        _newz = increment_Z(ws, sheet_row)
+        increment_Z(ws, sheet_row)
     except Exception as e:
         st.warning(f"ไม่สามารถอัปเดตคอลัมน์ Z ได้: {e}")
     st.session_state["expired_processed"] = True
     st.session_state["timer_stopped"] = True
-    st.error("คนไข้เสียชีวิตแล้ว")
-    st.rerun()  # รีเฟรชฝั่งเซิร์ฟเวอร์เพื่อซ่อนกล่องทันที
+    st.rerun()
+
+# ===== สถานะล็อก =====
+locked = (remaining <= 0) or st.session_state["expired_processed"] or st.session_state["timer_stopped"]
 
 # ===== แสดง/ซ่อนตัวจับเวลา =====
-show_timer = not (st.session_state["timer_stopped"] or st.session_state["expired_processed"])
-if show_timer:
+if not locked:
     render_countdown(origin_seconds, remaining, paused=False)
-# (ถ้าไม่ show_timer → ไม่วาดกล่อง)
 
-# ---------------- Defaults to avoid NameError ----------------
+# ===== ถ้าล็อก ให้ขึ้น Overlay + ข้อความ =====
+if locked:
+    show_lock_overlay("คนไข้เสียชีวิตแล้ว")
+    st.error("คนไข้เสียชีวิตแล้ว")
+
+# ---------------- Defaults (กัน NameError) ----------------
 df_AK = None
 df_AC_RU = None
 df_AC_RV = None
@@ -513,18 +532,7 @@ headers_LQ = ["L","M","N","O","P","Q"]
 current_LQ = []
 current_V = ""
 
-# # ---------------- Defaults to avoid NameError ----------------
-df_AK = None
-df_AC_RU = None
-df_AC_RV = None
-headers_LQ = ["L","M","N","O","P","Q"]
-current_LQ = []
-current_V = ""
-
-# ===== เตรียม DataFrames แต่ละโหมด (ถ้ายังไม่มี) =====
-# ใช้ if แยกเป็นก้อน ๆ (เลี่ยง elif) เพื่อกัน SyntaxError เวลามีโค้ดอื่นคั่นกลาง
-
-# edit1: A–K + L–Q
+# ===== เตรียม payload ตามโหมด =====
 if mode == "edit1" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
@@ -535,7 +543,6 @@ if mode == "edit1" and not has_inline_phase2:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
 
-# edit2: R–U + V
 if mode == "edit2" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
@@ -545,7 +552,6 @@ if mode == "edit2" and not has_inline_phase2:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
 
-# view: A–C + R–V
 if mode == "view":
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
@@ -562,123 +568,118 @@ if mode == "view":
         st.error("คนไข้เสียชีวิตแล้ว")
     else:
         st.success("Triage completed")
-    if st.button("Triage again", disabled=form_disabled):
+    # ไม่ต้องมีปุ่ม Triage again ตอนถูกล็อก
+    if not locked and st.button("Triage again"):
         st.session_state["next_after_lq"] = None
         set_query_params(row=str(display_row), mode="edit1")
         st.rerun()
 
 elif mode == "edit2" and not has_inline_phase2:
     if df_AC_RU is None:
-        # กันเหนียว
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
         df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
         current_V = data.get("current_V", current_V)
 
     render_kv_grid(df_AC_RU, title="Patient", cols=2)
     st.markdown("#### Secondary Triage")
-    idx = ALLOWED_V.index(current_V) if current_V in ALLOWED_V else 0
-    with st.form("form_v", border=True):
-        v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx, disabled=form_disabled)
-        submitted = st.form_submit_button("Submit Treatment", disabled=form_disabled)
-    if submitted:
-        try:
-            res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
-            if res.get("status") == "ok":
-                # หยุดเวลา (GAS ถ้ามี endpoint; ถ้าไม่มีจะข้าม)
-                try:
-                    gas_stop_timer(display_row)
-                except Exception:
-                    pass
-                # หยุด UI + แจ้งเตือน + ไปหน้า view
-                st.session_state["timer_stopped"] = True
-                st.toast("⏸ Timer Stopped")
-                final = res.get("final", {})
-                df_final = pd.DataFrame([final.get("A_C_R_V", {})])
-                render_kv_grid(df_final, title="Patient", cols=2)
-                set_query_params(row=str(display_row), mode="view")
-                st.rerun()  # รีเฟรชทันทีหลัง submit
-            else:
-                st.error(f"Update V failed: {res}")
-        except Exception as e:
-            st.error(f"Failed to update V: {e}")
+
+    if not locked:
+        idx = ALLOWED_V.index(current_V) if current_V in ALLOWED_V else 0
+        with st.form("form_v"):
+            v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx)
+            submitted = st.form_submit_button("Submit Treatment")
+        if submitted:
+            try:
+                res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
+                if res.get("status") == "ok":
+                    try:
+                        gas_stop_timer(display_row)  # ถ้ามี endpoint
+                    except Exception:
+                        pass
+                    st.session_state["timer_stopped"] = True
+                    st.toast("⏸ Timer Stopped")
+                    set_query_params(row=str(display_row), mode="view")
+                    st.rerun()
+                else:
+                    st.error(f"Update V failed: {res}")
+            except Exception as e:
+                st.error(f"Failed to update V: {e}")
+    else:
+        st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
 
 else:
     # Phase 1: A–K + L–Q form
     if not has_inline_phase2:
-        # --- ENSURE df_AK, headers_LQ, current_LQ are present ---
         if df_AK is None:
-            try:
-                _data_edit1 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
-                df_AK = pd.DataFrame([_data_edit1.get("A_K", {})])
-                headers_LQ = _data_edit1.get("headers_LQ", headers_LQ)
-                current_LQ = _data_edit1.get("current_LQ", current_LQ)
-            except Exception as e:
-                st.error(f"Failed to read sheet (edit1): {e}")
-                st.stop()
-        # ---------------------------------------------------------
+            _data_edit1 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
+            df_AK = pd.DataFrame([_data_edit1.get("A_K", {})])
+            headers_LQ = _data_edit1.get("headers_LQ", ["L","M","N","O","P","Q"])
+            current_LQ = _data_edit1.get("current_LQ", [])
 
         render_kv_grid(df_AK, title="Patient", cols=2)
         st.markdown("#### Treatment")
-        l_col, r_col = st.columns(2)
-        selections = {}
-        curr_vals = current_LQ if current_LQ and len(current_LQ) == 6 else ["No"] * 6
 
-        with st.form("form_lq", border=True):
-            with l_col:
-                for i, label in enumerate(headers_LQ[:3]):
-                    default = True if curr_vals[i] == "Yes" else False
-                    chk = st.checkbox(f"{label}", value=default, disabled=form_disabled)
-                    selections[label] = "Yes" if chk else "No"
-            with r_col:
-                for i, label in enumerate(headers_LQ[3:6], start=3):
-                    default = True if curr_vals[i] == "Yes" else False
-                    chk = st.checkbox(f"{label}", value=default, disabled=form_disabled)
-                    selections[label] = "Yes" if chk else "No"
+        if not locked:
+            l_col, r_col = st.columns(2)
+            selections = {}
+            curr_vals = current_LQ if current_LQ and len(current_LQ) == 6 else ["No"] * 6
 
-            submitted = st.form_submit_button("Submit", disabled=form_disabled)
+            with st.form("form_lq"):
+                with l_col:
+                    for i, label in enumerate(headers_LQ[:3]):
+                        default = True if curr_vals[i] == "Yes" else False
+                        chk = st.checkbox(f"{label}", value=default)
+                        selections[label] = "Yes" if chk else "No"
+                with r_col:
+                    for i, label in enumerate(headers_LQ[3:6], start=3):
+                        default = True if curr_vals[i] == "Yes" else False
+                        chk = st.checkbox(f"{label}", value=default)
+                        selections[label] = "Yes" if chk else "No"
 
-        if submitted:
-            try:
-                res = update_LQ(ws, sheet_row=sheet_row, lq_values=selections)
-                if res.get("status") == "ok":
-                    st.session_state["next_after_lq"] = res.get("next", {})
-                else:
-                    st.error(f"Update L–Q failed: {res}")
-            except Exception as e:
-                st.error(f"Failed to update L–Q: {e}")
+                submitted = st.form_submit_button("Submit")
+
+            if submitted:
+                try:
+                    res = update_LQ(ws, sheet_row=sheet_row, lq_values=selections)
+                    if res.get("status") == "ok":
+                        st.session_state["next_after_lq"] = res.get("next", {})
+                    else:
+                        st.error(f"Update L–Q failed: {res}")
+                except Exception as e:
+                    st.error(f"Failed to update L–Q: {e}")
+        else:
+            st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
 
     # Inline phase 2 after L–Q submit
     nxt = st.session_state.get("next_after_lq")
     if nxt:
         df_ru = pd.DataFrame([nxt.get("A_C_R_U", {})])
         render_kv_grid(df_ru, title="Patient", cols=2)
-
         st.markdown("#### Secondary Triage")
-        current_V2 = nxt.get("current_V", "")
-        idx2 = ALLOWED_V.index(current_V2) if current_V2 in ALLOWED_V else 0
-        with st.form("form_v_inline", border=True):
-            v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2, disabled=form_disabled)
-            v_submitted = st.form_submit_button("Submit Treatment", disabled=form_disabled)
 
-        if v_submitted:
-            try:
-                res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
-                if res2.get("status") == "ok":
-                    # หยุดเวลา (GAS ถ้ามี endpoint)
-                    try:
-                        gas_stop_timer(display_row)
-                    except Exception:
-                        pass
-                    # หยุด UI + แจ้งเตือน + ไปหน้า view
-                    st.session_state["timer_stopped"] = True
-                    st.toast("⏸ Timer Stopped")
-                    final = res2.get("final", {})
-                    df_final = pd.DataFrame([final.get("A_C_R_V", {})])
-                    render_kv_grid(df_final, title="Patient", cols=2)
-                    st.session_state["next_after_lq"] = None
-                    set_query_params(row=str(display_row), mode="view")
-                    st.rerun()
-                else:
-                    st.error(f"Update V failed: {res2}")
-            except Exception as e:
-                st.error(f"Failed to update V: {e}")
+        if not locked:
+            current_V2 = nxt.get("current_V", "")
+            idx2 = ALLOWED_V.index(current_V2) if current_V2 in ALLOWED_V else 0
+            with st.form("form_v_inline"):
+                v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2)
+                v_submitted = st.form_submit_button("Submit Treatment")
+
+            if v_submitted:
+                try:
+                    res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
+                    if res2.get("status") == "ok":
+                        try:
+                            gas_stop_timer(display_row)
+                        except Exception:
+                            pass
+                        st.session_state["timer_stopped"] = True
+                        st.toast("⏸ Timer Stopped")
+                        st.session_state["next_after_lq"] = None
+                        set_query_params(row=str(display_row), mode="view")
+                        st.rerun()
+                    else:
+                        st.error(f"Update V failed: {res2}")
+                except Exception as e:
+                    st.error(f"Failed to update V: {e}")
+        else:
+            st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
