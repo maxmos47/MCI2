@@ -30,7 +30,7 @@ if "timer_stopped" not in st.session_state:
 if "expired_processed" not in st.session_state:
     st.session_state["expired_processed"] = False  # กันเพิ่ม Z ซ้ำตอนหมดเวลา
 if "treated" not in st.session_state:
-    st.session_state["treated"] = False  # ผู้ป่วยได้รับการรักษาแล้ว
+    st.session_state["treated"] = False  # ผู้ป่วยได้รับการรักษาแล้ว (finalized)
 
 # =========================
 # Helpers: Google Sheets client
@@ -624,8 +624,28 @@ elif mode == "edit2" and not has_inline_phase2:
         idx = ALLOWED_V.index(current_V) if current_V in ALLOWED_V else 0
         with st.form("form_v"):
             v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx)
-            submitted = st.form_submit_button("Submit Triage")
-        if submitted:
+            col1, col2 = st.columns(2)
+            with col1:
+                save_clicked = st.form_submit_button("💾 Save Treatment")
+            with col2:
+                finalize_clicked = st.form_submit_button("✅ Submit Triage (Finalize)")
+
+        if save_clicked and not finalize_clicked:
+            # บันทึกชั่วคราว: อนุญาตให้กดหลายครั้งเพื่อดูผลอัปเดต
+            try:
+                res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
+                if res.get("status") == "ok":
+                    st.success("บันทึก Treatment แล้ว (ยังไม่ Finalize)")
+                    # reload หน้าใน mode=edit2 เพื่อให้ค่าปรับใหม่สะท้อนทันที
+                    set_query_params(row=str(display_row), mode="edit2")
+                    st.rerun()
+                else:
+                    st.error(f"Update V failed: {res}")
+            except Exception as e:
+                st.error(f"Failed to update V: {e}")
+
+        if finalize_clicked:
+            # Finalize: ล็อกถาวร + หยุด timer + ไปหน้า view
             try:
                 res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                 if res.get("status") == "ok":
@@ -641,7 +661,7 @@ elif mode == "edit2" and not has_inline_phase2:
                 else:
                     st.error(f"Update V failed: {res}")
             except Exception as e:
-                st.error(f"Failed to update V: {e}")
+                st.error(f"Failed to finalize V: {e}")
     else:
         st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
 
@@ -700,9 +720,27 @@ else:
             idx2 = ALLOWED_V.index(current_V2) if current_V2 in ALLOWED_V else 0
             with st.form("form_v_inline"):
                 v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2)
-                v_submitted = st.form_submit_button("Submit Triage")
+                col1, col2 = st.columns(2)
+                with col1:
+                    save2 = st.form_submit_button("💾 Save Treatment")
+                with col2:
+                    finalize2 = st.form_submit_button("✅ Submit Triage (Finalize)")
 
-            if v_submitted:
+            if save2 and not finalize2:
+                try:
+                    res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
+                    if res2.get("status") == "ok":
+                        st.success("บันทึก Treatment แล้ว (ยังไม่ Finalize)")
+                        # คงอยู่ใน inline phase ต่อไปเพื่อปรับได้อีก
+                        set_query_params(row=str(display_row), mode="edit2")
+                        st.session_state["next_after_lq"] = None  # ไปหน้าหลักของ edit2
+                        st.rerun()
+                    else:
+                        st.error(f"Update V failed: {res2}")
+                except Exception as e:
+                    st.error(f"Failed to update V: {e}")
+
+            if finalize2:
                 try:
                     res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                     if res2.get("status") == "ok":
@@ -719,6 +757,6 @@ else:
                     else:
                         st.error(f"Update V failed: {res2}")
                 except Exception as e:
-                    st.error(f"Failed to update V: {e}")
+                    st.error(f"Failed to finalize V: {e}")
         else:
             st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
