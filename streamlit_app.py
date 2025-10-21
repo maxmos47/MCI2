@@ -628,12 +628,15 @@ elif mode == "edit2":
             try:
                 res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                 if res.get("status") == "ok":
-                    st.success("อัปเดตผลแล้ว")
-                    # โหลด Result ปัจจุบัน
-                    latest = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
-                    df_res = pd.DataFrame([latest.get("A_C_R_V", {})])
-                    st.markdown("#### Result")
-                    render_kv_grid(df_res, cols=2)
+                    # หยุดเวลา + ล็อค + ไปหน้า view ทันที
+                    try:
+                        gas_stop_timer(display_row)
+                    except Exception:
+                        pass
+                    st.session_state["treated"] = True
+                    st.session_state["timer_stopped"] = True
+                    set_query_params(row=str(display_row), mode="view")
+                    st.rerun()
                 else:
                     st.error(f"Update V failed: {res}")
             except Exception as e:
@@ -642,7 +645,7 @@ elif mode == "edit2":
         st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
 
 else:
-    # Phase 1: A–K + L–Q form (อนุญาตให้กดซ้ำได้ แม้มีผลลัพธ์เฟส 2 แล้ว)
+    # Phase 1: A–K + L–Q form (อนุญาตแก้หลายครั้งได้ จนกว่าจะกด Triage)
     if df_AK is None:
         _data_edit1 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
         df_AK = pd.DataFrame([_data_edit1.get("A_K", {})])
@@ -685,7 +688,7 @@ else:
     else:
         st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
 
-    # Inline phase 2 preview/result (แสดงทุกครั้งถ้ามี next_after_lq) และอัปเดตสดจากชีทได้
+    # Inline phase 2 preview + One-shot Triage (กดได้ครั้งเดียว)
     nxt = st.session_state.get("next_after_lq")
     if nxt:
         df_ru = pd.DataFrame([nxt.get("A_C_R_U", {})])
@@ -699,16 +702,20 @@ else:
             with st.form("form_v_inline"):
                 v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2)
                 v_submitted = st.form_submit_button("Submit Triage")
+
             if v_submitted:
                 try:
                     res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                     if res2.get("status") == "ok":
-                        st.success("อัปเดตผลแล้ว")
-                        # รีเฟรช preview จากชีทล่าสุด เพื่อสะท้อน R–V ปัจจุบัน
-                        latest = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
-                        df_res2 = pd.DataFrame([latest.get("A_C_R_V", {})])
-                        st.markdown("#### Result")
-                        render_kv_grid(df_res2, cols=2)
+                        try:
+                            gas_stop_timer(display_row)
+                        except Exception:
+                            pass
+                        st.session_state["treated"] = True
+                        st.session_state["timer_stopped"] = True
+                        st.session_state["next_after_lq"] = None
+                        set_query_params(row=str(display_row), mode="view")
+                        st.rerun()
                     else:
                         st.error(f"Update V failed: {res2}")
                 except Exception as e:
