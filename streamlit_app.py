@@ -10,7 +10,7 @@ import requests  # ใช้เรียก GAS
 st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
 # =========================
-# CONFIG: Google Sheets (ของ Secondary เอง)
+# CONFIG (Secondary sheet)
 # =========================
 SPREADSHEET_ID = (st.secrets.get("gsheets", {}).get("spreadsheet_id", "") or "").strip()
 WORKSHEET_NAME = st.secrets.get("gsheets", {}).get("worksheet_name", "Secondary")
@@ -58,18 +58,16 @@ def open_ws():
 ALLOWED_V = ["Priority 1", "Priority 2", "Priority 3"]
 YN = ["Yes", "No"]
 
-# Keep phase-2 payload after L–Q submit (avoid extra reload)
+# ------- session state -------
 if "next_after_lq" not in st.session_state:
     st.session_state["next_after_lq"] = None
-
-# Timer state flags
 if "timer_stopped" not in st.session_state:
-    st.session_state["timer_stopped"] = False  # หยุดนับเพราะกด Submit Treatment
+    st.session_state["timer_stopped"] = False      # หยุดบน UI (จาก submit หรือหมดเวลา)
 if "expired_processed" not in st.session_state:
-    st.session_state["expired_processed"] = False  # กันการเพิ่ม Z ซ้ำเมื่อหมดเวลา
+    st.session_state["expired_processed"] = False  # กันเพิ่ม Z ซ้ำเมื่อหมดเวลา
 
 # =========================
-# Helpers for query params
+# Query params helpers
 # =========================
 def get_query_params() -> Dict[str, str]:
     try:
@@ -86,10 +84,9 @@ def set_query_params(**kwargs):
         st.experimental_set_query_params(**kwargs)
 
 # =========================
-# Utility: column helpers
+# Column helpers
 # =========================
 def col_letter_to_index(letter: str) -> int:
-    """A -> 1, B -> 2, ..."""
     letter = letter.upper()
     result = 0
     for ch in letter:
@@ -97,7 +94,6 @@ def col_letter_to_index(letter: str) -> int:
     return result
 
 def index_to_col_letter(idx: int) -> str:
-    """1 -> A, 2 -> B, ..."""
     letters = ""
     while idx > 0:
         idx, rem = divmod(idx - 1, 26)
@@ -105,10 +101,9 @@ def index_to_col_letter(idx: int) -> str:
     return letters
 
 # =========================
-# Sheets data access layer
+# Sheet access
 # =========================
 def get_header_and_row(ws, row: int) -> Tuple[List[str], List[str]]:
-    """Return (headers, values) where headers are row 1 and values are row N."""
     headers = ws.row_values(1)
     vals = ws.row_values(row)
     if len(vals) < len(headers):
@@ -116,7 +111,7 @@ def get_header_and_row(ws, row: int) -> Tuple[List[str], List[str]]:
     return headers, vals
 
 def slice_dict_by_cols(headers: List[str], vals: List[str], start_col: str, end_col: str) -> Dict[str, str]:
-    s = col_letter_to_index(start_col) - 1  # 0-based
+    s = col_letter_to_index(start_col) - 1
     e = col_letter_to_index(end_col) - 1
     out = {}
     for i in range(s, e + 1):
@@ -130,7 +125,9 @@ def build_payloads_from_row(ws, sheet_row: int, mode: str) -> Dict:
     AK = slice_dict_by_cols(headers, vals, "A", "K")
     LQ_dict = slice_dict_by_cols(headers, vals, "L", "Q")
     headers_LQ = list(LQ_dict.keys())
-    current_LQ = [LQ_dict[h] if LQ_dict[h] in YN else ("Yes" if str(LQ_dict[h]).strip().lower() == "yes" else "No") for h in headers_LQ]
+    current_LQ = [LQ_dict[h] if LQ_dict[h] in YN else ("Yes" if String(LQ_dict[h]).toLowerCase() === "yes" else "No") for h in headers_LQ] if False else [
+        LQ_dict[h] if LQ_dict[h] in YN else ("Yes" if str(LQ_dict[h]).strip().lower() == "yes" else "No") for h in headers_LQ
+    ]
     RU = slice_dict_by_cols(headers, vals, "R", "U")
     Vcol_idx = col_letter_to_index("V") - 1
     current_V = vals[Vcol_idx] if Vcol_idx < len(vals) else ""
@@ -156,7 +153,7 @@ def update_LQ(ws, sheet_row: int, lq_values: Dict[str, str]) -> Dict:
     updates = []
     for h, v in lq_values.items():
         if h in headers:
-            col_idx = headers.index(h) + 1  # 1-based
+            col_idx = headers.index(h) + 1
             a1 = f"{ws.title}!{index_to_col_letter(col_idx)}{sheet_row}"
             updates.append({"range": a1, "majorDimension": "ROWS", "values": [[v]]})
     if updates:
@@ -174,7 +171,6 @@ def update_V(ws, sheet_row: int, v_value: str) -> Dict:
     return {"status": "ok", "final": {"A_C_R_V": {**AC, **RV}}}
 
 def increment_Z(ws, sheet_row: int) -> int:
-    """เพิ่มค่า 1 ที่คอลัมน์ Z (ตัวเลข), คืนค่าหลังอัปเดต"""
     Z_idx = col_letter_to_index("Z")
     cell = f"{index_to_col_letter(Z_idx)}{sheet_row}"
     try:
@@ -190,7 +186,46 @@ def increment_Z(ws, sheet_row: int) -> int:
     return new_val
 
 # =========================
-# Card UI (mobile-friendly)
+# GAS helpers (Primary)
+# =========================
+def gas_get_row(row: int) -> dict:
+    url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not url:
+        return {}
+    params = {"action": "get", "row": str(row)}
+    tok = st.secrets.get("gas", {}).get("token", "")
+    if tok:
+        params["token"] = tok
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def gas_start_timer(row: int) -> dict:
+    url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not url:
+        return {}
+    data = {"action": "start_timer", "row": str(row)}
+    tok = st.secrets.get("gas", {}).get("token", "")
+    if tok:
+        data["token"] = tok
+    r = requests.post(url, data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def gas_stop_timer(row: int) -> dict:
+    url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not url:
+        return {}
+    data = {"action": "stop_timer", "row": str(row)}
+    tok = st.secrets.get("gas", {}).get("token", "")
+    if tok:
+        data["token"] = tok
+    r = requests.post(url, data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+# =========================
+# UI Helpers (cards + countdown)
 # =========================
 st.markdown("""
 <style>
@@ -234,106 +269,6 @@ def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
                     unsafe_allow_html=True
                 )
 
-# =========================
-# GAS helpers (ใช้ข้อมูลเวลาเดียวกับ Primary)
-# =========================
-def gas_get_row(row: int) -> dict:
-    url = st.secrets.get("gas", {}).get("webapp_url", "")
-    if not url:
-        return {}
-    params = {"action": "get", "row": str(row)}
-    tok = st.secrets.get("gas", {}).get("token", "")
-    if tok:
-        params["token"] = tok
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-def gas_start_timer(row: int) -> dict:
-    url = st.secrets.get("gas", {}).get("webapp_url", "")
-    if not url:
-        return {}
-    data = {"action": "start_timer", "row": str(row)}
-    tok = st.secrets.get("gas", {}).get("token", "")
-    if tok:
-        data["token"] = tok
-    r = requests.post(url, data=data, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-# =========================
-# Timer helpers (fallback อ่านจากชีท Secondary ถ้าไม่มี GAS)
-# =========================
-def parse_seconds(value) -> int:
-    """รองรับ: 120, '120', '02:00', '00:01:30' และกรณี numeric day-fraction ของ Google Sheets"""
-    try:
-        if value is None or value == "":
-            return 0
-        if hasattr(value, "hour") and hasattr(value, "minute") and hasattr(value, "second"):
-            return max(0, int(value.hour) * 3600 + int(value.minute) * 60 + int(value.second))
-        if isinstance(value, (int, float)):
-            if 0 < float(value) < 2:
-                return max(0, int(round(float(value) * 86400)))
-            return max(0, int(round(float(value))))
-        s = str(value).strip()
-        if not s:
-            return 0
-        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
-            return max(0, int(s))
-        parts = s.split(":")
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            return max(0, int(parts[0]) * 60 + int(parts[1]))
-        if len(parts) == 3 and all(p.isdigit() for p in parts):
-            return max(0, int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
-    except Exception:
-        pass
-    return 0
-
-def read_timer_state(ws, sheet_row: int) -> dict:
-    """อ่าน Q/R/S ของแถวนั้น: คืน {origin, t0_epoch, end_epoch} (int ทั้งหมด)"""
-    headers, vals = get_header_and_row(ws, sheet_row)
-    q_idx = col_letter_to_index("Q") - 1
-    r_idx = col_letter_to_index("R") - 1
-    s_idx = col_letter_to_index("S") - 1
-
-    origin_raw = vals[q_idx] if q_idx < len(vals) else ""
-    t0_raw     = vals[r_idx] if r_idx < len(vals) else ""
-    end_raw    = vals[s_idx] if s_idx < len(vals) else ""
-
-    origin = parse_seconds(origin_raw)
-    try:
-        t0_epoch = int(float(t0_raw)) if str(t0_raw).strip() != "" else 0
-    except Exception:
-        t0_epoch = 0
-    try:
-        end_epoch = int(float(end_raw)) if str(end_raw).strip() != "" else 0
-    except Exception:
-        end_epoch = 0
-
-    return {"origin": origin, "t0_epoch": t0_epoch, "end_epoch": end_epoch}
-
-def start_timer_if_needed(ws, sheet_row: int, origin: int, t0_epoch: int, end_epoch: int) -> Tuple[int, int]:
-    """ตั้งค่า R/S ครั้งแรก (idempotent) บนชีท Secondary (fallback เท่านั้น)"""
-    if origin <= 0:
-        return t0_epoch, end_epoch
-    if t0_epoch > 0 and end_epoch > 0:
-        return t0_epoch, end_epoch
-
-    now = int(pd.Timestamp.utcnow().timestamp())
-    t0 = now if t0_epoch <= 0 else t0_epoch
-    end_ = t0 + origin if end_epoch <= 0 else end_epoch
-
-    r_a1 = f"{index_to_col_letter(col_letter_to_index('R'))}{sheet_row}"
-    s_a1 = f"{index_to_col_letter(col_letter_to_index('S'))}{sheet_row}"
-    ws.spreadsheet.values_batch_update(body={
-        "valueInputOption": "RAW",
-        "data": [
-            {"range": f"{ws.title}!{r_a1}", "majorDimension": "ROWS", "values": [[t0]]},
-            {"range": f"{ws.title}!{s_a1}", "majorDimension": "ROWS", "values": [[end_]]},
-        ]
-    })
-    return t0, end_
-
 def fmt_hms(secs: int) -> str:
     secs = max(0, int(secs))
     h, rem = divmod(secs, 3600)
@@ -341,27 +276,24 @@ def fmt_hms(secs: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
-    """โชว์ตัวเลข HH:MM:SS + progress bar; ถ้า paused=True จะไม่รัน JS (แช่ภาพ)"""
     import streamlit.components.v1 as components
     initial_digits = fmt_hms(remaining)
     progress_value = max(0, (origin_seconds - remaining) if origin_seconds else 0)
     progress_max = max(1, origin_seconds if origin_seconds > 0 else 1)
-
     if paused:
         components.html(
             f"""
             <div style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
               <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏸ Stopped</span>
-              <span id="digits" style="font-weight:800;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
+              <span style="font-weight:800;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
               <div style="margin-top:10px">
-                <progress id="pg" max="{progress_max}" value="{progress_value}" style="width:100%"></progress>
+                <progress max="{progress_max}" value="{progress_value}" style="width:100%"></progress>
               </div>
             </div>
             """,
             height=160,
         )
         return
-
     components.html(
         f"""
         <div style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
@@ -410,33 +342,27 @@ qp = get_query_params()
 display_row_str = qp.get("row", "1")
 mode = qp.get("mode", "edit1")  # edit1 -> L–Q; edit2 -> V; view -> final
 
-# Interpret URL row=1 as sheet row 2 (headers at row 1)
 try:
-    display_row = int(display_row_str)
-    if display_row < 1:
-        display_row = 1
+    display_row = max(1, int(display_row_str))
 except ValueError:
     display_row = 1
 
-sheet_row = display_row + 1  # shift by 1 so that "row=1" targets sheet row 2
+sheet_row = display_row + 1  # header offset
 
 ws = open_ws()
 has_inline_phase2 = st.session_state["next_after_lq"] is not None
 
-# ---------- TIMER (ใช้ GAS เป็นหลัก; fallback ชีท Secondary) ----------
+# ---------- TIMER: ใช้ GAS (Primary) เป็นหลัก / fallback ชีท Secondary ----------
 origin_seconds = 0
 t0_epoch = 0
 end_epoch = 0
 
-# 1) พยายามอ่านจาก GAS (ชีท Primary)
 try:
     g = gas_get_row(row=display_row)
     if g and g.get("status") == "ok":
         origin_seconds = int(g.get("timer_seconds", 0) or 0)
         t0_epoch = int(g.get("t0_epoch", 0) or 0)
         end_epoch = int(g.get("end_epoch", 0) or 0)
-
-        # ถ้า Q>0 แต่ยังไม่ set R/S → เริ่มที่ GAS (idempotent)
         if origin_seconds > 0 and end_epoch == 0:
             s = gas_start_timer(row=display_row)
             if s.get("status") == "ok":
@@ -445,37 +371,58 @@ try:
 except Exception as e:
     st.warning(f"GAS error, fallback to sheet: {e}")
 
-# 2) ถ้ายังไม่มี end_epoch จาก GAS → fallback: อ่านจากชีท Secondary
 if end_epoch == 0:
-    try:
-        ts = read_timer_state(ws, sheet_row)
-        origin_seconds = origin_seconds or int(ts["origin"])
-        t0_epoch = t0_epoch or int(ts["t0_epoch"])
-        end_epoch = end_epoch or int(ts["end_epoch"])
-        if origin_seconds > 0 and end_epoch == 0:
-            t0_epoch, end_epoch = start_timer_if_needed(ws, sheet_row, origin_seconds, t0_epoch, end_epoch)
-    except Exception as e:
-        st.warning(f"Sheet timer fallback error: {e}")
+    # fallback: secondary sheet (Q/R/S ที่ secondary เอง หากมี)
+    headers, vals = get_header_and_row(ws, sheet_row)
+    def _parse_seconds_local(v):
+        try:
+            if v is None or v == "": return 0
+            if isinstance(v, (int,float)):
+                if 0 < float(v) < 2: return int(round(float(v)*86400))
+                return int(round(float(v)))
+            s = str(v).strip()
+            if not s: return 0
+            if s.isdigit() or (s.startswith("-") and s[1:].isdigit()): return max(0,int(s))
+            p = s.split(":")
+            if len(p)==2 and all(x.isdigit() for x in p): return int(p[0])*60+int(p[1])
+            if len(p)==3 and all(x.isdigit() for x in p): return int(p[0])*3600+int(p[1])*60+int(p[2])
+        except: pass
+        return 0
+    q = _parse_seconds_local(vals[col_letter_to_index("Q")-1] if len(vals)>=col_letter_to_index("Q") else "")
+    r = int(float(vals[col_letter_to_index("R")-1])) if len(vals)>=col_letter_to_index("R") and str(vals[col_letter_to_index("R")-1]).strip()!="" else 0
+    s_ = int(float(vals[col_letter_to_index("S")-1])) if len(vals)>=col_letter_to_index("S") and str(vals[col_letter_to_index("S")-1]).strip()!="" else 0
+    origin_seconds = origin_seconds or q
+    t0_epoch = t0_epoch or r
+    end_epoch = end_epoch or s_
+    if origin_seconds>0 and end_epoch==0:
+        now_ts = int(pd.Timestamp.utcnow().timestamp())
+        t0_epoch = t0_epoch or now_ts
+        end_epoch = t0_epoch + origin_seconds
+        r_a1 = f"{index_to_col_letter(col_letter_to_index('R'))}{sheet_row}"
+        s_a1 = f"{index_to_col_letter(col_letter_to_index('S'))}{sheet_row}"
+        ws.spreadsheet.values_batch_update(body={
+            "valueInputOption":"RAW",
+            "data":[
+                {"range": f"{ws.title}!{r_a1}", "majorDimension":"ROWS", "values":[[t0_epoch]]},
+                {"range": f"{ws.title}!{s_a1}", "majorDimension":"ROWS", "values":[[end_epoch]]},
+            ]
+        })
 
-# คำนวณเวลาที่เหลือจาก end_epoch
+# คำนวณเวลาคงเหลือ และจัดการหมดเวลา
 now = int(pd.Timestamp.utcnow().timestamp())
 remaining = max(0, end_epoch - now) if end_epoch else 0
 
-# แสดง countdown (หยุดถ้ากด Submit Treatment ไปแล้ว)
-render_countdown(origin_seconds, remaining, paused=st.session_state["timer_stopped"])
-
-# ถ้าหมดเวลา แล้วยังไม่เคยประมวลผล "เสียชีวิต"
+# ถ้าหมดเวลา แล้วยังไม่เคยเพิ่ม Z/ล็อกฟอร์ม → ทำเลย
 if (remaining <= 0) and (not st.session_state["expired_processed"]):
     try:
-        _newz = increment_Z(ws, sheet_row)
+        increment_Z(ws, sheet_row)
         st.session_state["expired_processed"] = True
+        st.session_state["timer_stopped"] = True
         st.error("คนไข้เสียชีวิตแล้ว")
     except Exception as e:
         st.warning(f"ไม่สามารถอัปเดตคอลัมน์ Z ได้: {e}")
-    # ล็อกฟอร์มทันที
-    st.session_state["timer_stopped"] = True
 
-# Prepare dataframes by mode
+# -------------- เตรียมข้อมูลแต่ละโหมด (หลังจากอัปเดตหมดเวลาแล้ว) --------------
 if mode == "edit1" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
@@ -501,7 +448,11 @@ elif mode == "view":
         st.stop()
     df_AC_RV = pd.DataFrame([data.get("A_C_R_V", {})])
 
-form_disabled = st.session_state["timer_stopped"]  # true ถ้ากด submit แล้ว หรือหมดเวลา
+# -------------- แสดง Timer (หลังจัดการฟอร์ม/หมดเวลาแล้วเสมอ) --------------
+render_countdown(origin_seconds, remaining, paused=st.session_state["timer_stopped"])
+
+# ฟอร์มถูกล็อกจาก 2 เงื่อนไข: หมดเวลา หรือ เคยกด Submit Treatment แล้ว
+form_disabled = st.session_state["timer_stopped"]
 
 # ============ Modes ============
 if mode == "view":
@@ -526,12 +477,27 @@ elif mode == "edit2" and not has_inline_phase2:
         try:
             res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
             if res.get("status") == "ok":
-                st.session_state["timer_stopped"] = True  # หยุดนับเมื่อ submit treatment
+                # หยุดเวลาใน GAS → ให้ S=end=now ที่ต้นทางจริง
+                try:
+                    s = gas_stop_timer(row=display_row)
+                    if s.get("status") != "ok":
+                        st.warning(f"stop_timer (GAS) ไม่สำเร็จ: {s}")
+                except Exception as ee:
+                    # fallback: เซ็ต S ในชีท Secondary
+                    try:
+                        now_ts = int(pd.Timestamp.utcnow().timestamp())
+                        s_a1 = f"{index_to_col_letter(col_letter_to_index('S'))}{sheet_row}"
+                        ws.update_acell(s_a1, now_ts)
+                    except Exception as e2:
+                        st.warning(f"fallback stop (sheet) ไม่สำเร็จ: {e2}")
+
+                st.session_state["timer_stopped"] = True
                 final = res.get("final", {})
                 df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                 render_kv_grid(df_final, title="Patient", cols=2)
                 st.success("Saved. Final view (no form).")
                 set_query_params(row=str(display_row), mode="view")
+                st.rerun()
             else:
                 st.error(f"Update V failed: {res}")
         except Exception as e:
@@ -587,13 +553,27 @@ else:
             try:
                 res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                 if res2.get("status") == "ok":
-                    st.session_state["timer_stopped"] = True  # หยุดนับเมื่อ submit treatment
+                    # หยุดเวลาใน GAS
+                    try:
+                        s = gas_stop_timer(row=display_row)
+                        if s.get("status") != "ok":
+                            st.warning(f"stop_timer (GAS) ไม่สำเร็จ: {s}")
+                    except Exception as ee:
+                        try:
+                            now_ts = int(pd.Timestamp.utcnow().timestamp())
+                            s_a1 = f"{index_to_col_letter(col_letter_to_index('S'))}{sheet_row}"
+                            ws.update_acell(s_a1, now_ts)
+                        except Exception as e2:
+                            st.warning(f"fallback stop (sheet) ไม่สำเร็จ: {e2}")
+
+                    st.session_state["timer_stopped"] = True
                     final = res2.get("final", {})
                     df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                     render_kv_grid(df_final, title="Patient", cols=2)
                     st.success("Triage เรียบร้อย")
                     st.session_state["next_after_lq"] = None
                     set_query_params(row=str(display_row), mode="view")
+                    st.rerun()
                 else:
                     st.error(f"Update V failed: {res2}")
             except Exception as e:
