@@ -212,17 +212,50 @@ def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
                 )
 
 # =========================
-# Timer helpers (Q origin sec, R t0_epoch, S end_epoch)
+# Timer config (ปรับได้จาก secrets)
+# =========================
+ORIGIN_COL = st.secrets.get("timer", {}).get("origin_column", "Q")  # ถ้า origin ไม่ได้อยู่ที่ Q ให้เปลี่ยนใน secrets
+USE_GAS_FIRST = bool(st.secrets.get("gas", {}).get("webapp_url", ""))  # ถ้ามี GAS จะใช้เป็นแหล่งข้อมูลหลัก
+
+# =========================
+# (ทางเลือก) ดึงจาก GAS ถ้ามี
+# =========================
+import requests
+
+def gas_get_row(row: int) -> dict:
+    gas_url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not gas_url:
+        return {}
+    params = {"action": "get", "row": str(row)}
+    token = st.secrets.get("gas", {}).get("token", "")
+    if token:
+        params["token"] = token
+    r = requests.get(gas_url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def gas_start_timer(row: int) -> dict:
+    gas_url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not gas_url:
+        return {}
+    payload = {"action": "start_timer", "row": str(row)}
+    token = st.secrets.get("gas", {}).get("token", "")
+    if token:
+        payload["token"] = token
+    r = requests.post(gas_url, data=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+# =========================
+# Timer helpers (อ่านจากชีทโดยตรง)
 # =========================
 def parse_seconds(value) -> int:
-    """รองรับ: 120, '120', '02:00', '00:01:30' และกรณี numeric day-fraction ของ Google Sheets"""
+    """รองรับ: 120, '120', '02:00', '00:01:30' และ numeric day-fraction ของ Google Sheets"""
     try:
         if value is None or value == "":
             return 0
-        # date-like (กันเผื่อ กรณี gspread แปลงเป็น datetime)
         if hasattr(value, "hour") and hasattr(value, "minute") and hasattr(value, "second"):
             return max(0, int(value.hour) * 3600 + int(value.minute) * 60 + int(value.second))
-        # number (seconds หรือ day-fraction)
         if isinstance(value, (int, float)):
             if 0 < float(value) < 2:
                 return max(0, int(round(float(value) * 86400)))
@@ -241,10 +274,11 @@ def parse_seconds(value) -> int:
         pass
     return 0
 
-def read_timer_state(ws, sheet_row: int) -> dict:
-    """อ่าน Q/R/S ของแถวนั้น: คืน {origin, t0_epoch, end_epoch} (int ทั้งหมด)"""
+def read_timer_state_from_sheet(ws, sheet_row: int) -> dict:
+    """อ่าน ORIGIN(Raw) จาก ORIGIN_COL, และอ่าน R/S: คืน {origin, t0_epoch, end_epoch, debug}"""
     headers, vals = get_header_and_row(ws, sheet_row)
-    q_idx = col_letter_to_index("Q") - 1
+    # หา index ตามตัวอักษรคอลัมน์
+    q_idx = col_letter_to_index(ORIGIN_COL) - 1
     r_idx = col_letter_to_index("R") - 1
     s_idx = col_letter_to_index("S") - 1
 
@@ -262,16 +296,13 @@ def read_timer_state(ws, sheet_row: int) -> dict:
     except Exception:
         end_epoch = 0
 
-    return {"origin": origin, "t0_epoch": t0_epoch, "end_epoch": end_epoch}
+    return {"origin": origin, "t0_epoch": t0_epoch, "end_epoch": end_epoch,
+            "debug": {"origin_raw": origin_raw, "R": t0_raw, "S": end_raw, "ORIGIN_COL": ORIGIN_COL}}
 
-def start_timer_if_needed(ws, sheet_row: int, origin: int, t0_epoch: int, end_epoch: int) -> Tuple[int, int]:
-    """
-    เริ่มตั้ง R(t0) และ S(end) ถ้ายังไม่ตั้ง (idempotent)
-    คืนค่า (t0_epoch, end_epoch) ที่อัปเดตแล้ว
-    """
+def start_timer_if_needed_on_sheet(ws, sheet_row: int, origin: int, t0_epoch: int, end_epoch: int) -> tuple[int, int]:
+    """ตั้งค่า R/S ครั้งแรก (idempotent) บนชีท"""
     if origin <= 0:
         return t0_epoch, end_epoch
-
     if t0_epoch > 0 and end_epoch > 0:
         return t0_epoch, end_epoch
 
@@ -297,7 +328,7 @@ def fmt_hms(secs: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def render_countdown(origin_seconds: int, remaining: int):
-    """โชว์ตัวเลข HH:MM:SS + progress bar (JS ฝั่ง client, ไม่ต้อง rerun)"""
+    """ตัวเลข HH:MM:SS + progress bar (JS, ไม่ต้อง rerun)"""
     import streamlit.components.v1 as components
     initial_digits = fmt_hms(remaining)
     progress_value = max(0, (origin_seconds - remaining) if origin_seconds else 0)
@@ -341,6 +372,73 @@ def render_countdown(origin_seconds: int, remaining: int):
         """,
         height=160,
     )
+
+# =========================
+# ใช้งานจริง: อ่านสถานะ/เริ่ม/แสดงผล
+# =========================
+try:
+    origin_seconds = 0
+    t0_epoch = 0
+    end_epoch = 0
+    debug_info = {}
+
+    if USE_GAS_FIRST:
+        # 1) พยายามอ่านจาก GAS ก่อน (เหมือน Primary)
+        try:
+            # display_row มาจากด้านบนของไฟล์คุณ
+            gas_row = display_row
+            gas_data = gas_get_row(row=gas_row)
+            if gas_data.get("status") == "ok":
+                origin_seconds = int(gas_data.get("timer_seconds", 0) or 0)
+                t0_epoch = int(gas_data.get("t0_epoch", 0) or 0)
+                end_epoch = int(gas_data.get("end_epoch", 0) or 0)
+                # ถ้า Q>0 แต่มันยังไม่ start ที่เซิร์ฟเวอร์ → start ที่ GAS
+                if origin_seconds > 0 and end_epoch == 0:
+                    started = gas_start_timer(row=gas_row)
+                    if started.get("status") == "ok":
+                        t0_epoch = int(started.get("t0_epoch", t0_epoch) or 0)
+                        end_epoch = int(started.get("end_epoch", end_epoch) or 0)
+        except Exception as e:
+            st.warning(f"GAS fetch failed, fallback to sheet: {e}")
+
+    if not USE_GAS_FIRST or end_epoch == 0:
+        # 2) ถ้ายังไม่ได้ end_epoch → fallback อ่านจากชีทโดยตรง
+        ts = read_timer_state_from_sheet(ws, sheet_row)
+        origin_seconds = origin_seconds or int(ts["origin"])
+        t0_epoch = t0_epoch or int(ts["t0_epoch"])
+        end_epoch = end_epoch or int(ts["end_epoch"])
+        debug_info = ts.get("debug", {})
+
+        # ถ้า Q>0 แต่ R/S ยังว่าง → ตั้ง R/S ในชีทเลย (idempotent)
+        if origin_seconds > 0 and end_epoch == 0:
+            t0_epoch, end_epoch = start_timer_if_needed_on_sheet(ws, sheet_row, origin_seconds, t0_epoch, end_epoch)
+
+    # คำนวณเวลาที่เหลือ “จาก S เป็นหลัก”
+    now = int(pd.Timestamp.utcnow().timestamp())
+    remaining = max(0, end_epoch - now) if end_epoch else 0
+
+    # แสดง
+    render_countdown(origin_seconds, remaining)
+
+    # Panel debug เล็ก ๆ (ช่วยไล่เคสค่า Q เป็น Yes/No)
+    with st.expander("🛠 Timer diagnostics"):
+        st.write({
+            "origin_seconds": origin_seconds,
+            "t0_epoch": t0_epoch,
+            "end_epoch": end_epoch,
+            "remaining_now": remaining,
+            "use_gas_first": USE_GAS_FIRST,
+            "origin_column": ORIGIN_COL,
+            **({"sheet_debug": debug_info} if debug_info else {})
+        })
+
+    # แจ้งเตือนเคสยอดฮิต
+    if origin_seconds == 0 and end_epoch == 0:
+        st.info("Timer เป็น 0: ตรวจดูว่าในชีทคอลัมน์ต้นทาง (ค่า ORIGIN_COL ปัจจุบันคือ "
+                f"'{ORIGIN_COL}') มีวินาที/เวลาอยู่จริงหรือไม่ (เช่น 120, 02:00, 00:01:30)")
+
+except Exception as e:
+    st.warning(f"Timer error: {e}")
 
 # =========================
 # Main UI
