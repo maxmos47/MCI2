@@ -437,7 +437,21 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
         height=160,
     )
 
-def show_lock_overlay(message: str = "คนไข้เสียชีวิตแล้ว"):
+def show_lock_overlay(message: str, variant: str = "expired"):
+    """
+    variant:
+      - "treated"  → โทนเขียว ไอคอน ✅ (คนไข้ได้รับการรักษาแล้ว)
+      - "expired"  → โทนแดง ไอคอน ⛔ (คนไข้เสียชีวิตแล้ว)
+    """
+    if variant == "treated":
+        icon = "✅"
+        accent = "#16a34a"   # green-600
+        bg_pill = "#dcfce7"  # green-100
+    else:
+        icon = "⛔"
+        accent = "#ef4444"   # red-500
+        bg_pill = "#fee2e2"  # red-100
+
     st.markdown(
         f"""
         <style>
@@ -450,16 +464,24 @@ def show_lock_overlay(message: str = "คนไข้เสียชีวิต
         }}
         .lock-card {{
           background: #fff; color:#111827;
-          padding: 24px 28px; border-radius: 16px;
-          box-shadow: 0 10px 30px rgba(0,0,0,.25);
-          max-width: 90vw; text-align:center;
+          padding: 28px 32px; border-radius: 16px;
+          box-shadow: 0 12px 32px rgba(0,0,0,.28);
+          max-width: 90vw; text-align:center; min-width: 320px;
+          border-top: 6px solid {accent};
         }}
-        .lock-card h2 {{ margin: 0 0 8px 0; font-size: 1.6rem; }}
-        .lock-card p {{ margin: 0; font-size: 1rem; color:#4b5563; }}
+        .lock-icon {{
+          width: 64px; height: 64px; border-radius: 999px;
+          display: inline-flex; align-items: center; justify-content: center;
+          font-size: 34px; margin-bottom: 10px;
+          background: {bg_pill}; color: {accent};
+        }}
+        .lock-card h2 {{ margin: 6px 0 8px 0; font-size: 1.5rem; color:#111827; }}
+        .lock-card p  {{ margin: 0; font-size: 1rem; color:#4b5563; }}
         </style>
         <div class="lock-overlay">
           <div class="lock-card">
-            <h2>⛔ {message}</h2>
+            <div class="lock-icon">{icon}</div>
+            <h2>{message}</h2>
             <p>ฟอร์มถูกล็อกแล้ว ไม่สามารถแก้ไขได้</p>
           </div>
         </div>
@@ -532,10 +554,10 @@ if not locked:
 # ===== ข้อความและ Overlay ตามสถานะ =====
 if locked:
     if treated:
-        show_lock_overlay("คนไข้ได้รับการรักษาแล้ว")
+        show_lock_overlay("คนไข้ได้รับการรักษาแล้ว", variant="treated")
         st.success("คนไข้ได้รับการรักษาแล้ว")
     else:
-        show_lock_overlay("คนไข้เสียชีวิตแล้ว")
+        show_lock_overlay("คนไข้เสียชีวิตแล้ว", variant="expired")
         st.error("คนไข้เสียชีวิตแล้ว")
 
 # ---------------- Defaults (กัน NameError) ----------------
