@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-import requests  # ⬅️ ใช้เรียก GAS
+import requests  # ใช้เรียก GAS
 
 st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
@@ -61,6 +61,12 @@ YN = ["Yes", "No"]
 # Keep phase-2 payload after L–Q submit (avoid extra reload)
 if "next_after_lq" not in st.session_state:
     st.session_state["next_after_lq"] = None
+
+# Timer state flags
+if "timer_stopped" not in st.session_state:
+    st.session_state["timer_stopped"] = False  # หยุดนับเพราะกด Submit Treatment
+if "expired_processed" not in st.session_state:
+    st.session_state["expired_processed"] = False  # กันการเพิ่ม Z ซ้ำเมื่อหมดเวลา
 
 # =========================
 # Helpers for query params
@@ -166,6 +172,22 @@ def update_V(ws, sheet_row: int, v_value: str) -> Dict:
     AC = slice_dict_by_cols(headers, vals, "A", "C")
     RV = slice_dict_by_cols(headers, vals, "R", "V")
     return {"status": "ok", "final": {"A_C_R_V": {**AC, **RV}}}
+
+def increment_Z(ws, sheet_row: int) -> int:
+    """เพิ่มค่า 1 ที่คอลัมน์ Z (ตัวเลข), คืนค่าหลังอัปเดต"""
+    Z_idx = col_letter_to_index("Z")
+    cell = f"{index_to_col_letter(Z_idx)}{sheet_row}"
+    try:
+        cur = ws.acell(cell).value
+    except Exception:
+        cur = ""
+    try:
+        base = int(float(cur))
+    except Exception:
+        base = 0
+    new_val = base + 1
+    ws.update_acell(cell, new_val)
+    return new_val
 
 # =========================
 # Card UI (mobile-friendly)
@@ -318,12 +340,27 @@ def fmt_hms(secs: int) -> str:
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def render_countdown(origin_seconds: int, remaining: int):
-    """โชว์ตัวเลข HH:MM:SS + progress bar (JS ฝั่ง client, ไม่ต้อง rerun)"""
+def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
+    """โชว์ตัวเลข HH:MM:SS + progress bar; ถ้า paused=True จะไม่รัน JS (แช่ภาพ)"""
     import streamlit.components.v1 as components
     initial_digits = fmt_hms(remaining)
     progress_value = max(0, (origin_seconds - remaining) if origin_seconds else 0)
     progress_max = max(1, origin_seconds if origin_seconds > 0 else 1)
+
+    if paused:
+        components.html(
+            f"""
+            <div style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
+              <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏸ Stopped</span>
+              <span id="digits" style="font-weight:800;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
+              <div style="margin-top:10px">
+                <progress id="pg" max="{progress_max}" value="{progress_value}" style="width:100%"></progress>
+              </div>
+            </div>
+            """,
+            height=160,
+        )
+        return
 
     components.html(
         f"""
@@ -423,10 +460,20 @@ if end_epoch == 0:
 # คำนวณเวลาที่เหลือจาก end_epoch
 now = int(pd.Timestamp.utcnow().timestamp())
 remaining = max(0, end_epoch - now) if end_epoch else 0
-render_countdown(origin_seconds, remaining)
 
-if origin_seconds == 0 and end_epoch == 0:
-    st.info("Secondary ไม่เจอสถานะเวลาใน GAS/ชีท: ตรวจ row หรือ [gas].webapp_url/token ใน secrets และว่าฝั่ง Primary ได้ตั้ง Q/R/S แล้ว")
+# แสดง countdown (หยุดถ้ากด Submit Treatment ไปแล้ว)
+render_countdown(origin_seconds, remaining, paused=st.session_state["timer_stopped"])
+
+# ถ้าหมดเวลา แล้วยังไม่เคยประมวลผล "เสียชีวิต"
+if (remaining <= 0) and (not st.session_state["expired_processed"]):
+    try:
+        _newz = increment_Z(ws, sheet_row)
+        st.session_state["expired_processed"] = True
+        st.error("คนไข้เสียชีวิตแล้ว")
+    except Exception as e:
+        st.warning(f"ไม่สามารถอัปเดตคอลัมน์ Z ได้: {e}")
+    # ล็อกฟอร์มทันที
+    st.session_state["timer_stopped"] = True
 
 # Prepare dataframes by mode
 if mode == "edit1" and not has_inline_phase2:
@@ -454,11 +501,16 @@ elif mode == "view":
         st.stop()
     df_AC_RV = pd.DataFrame([data.get("A_C_R_V", {})])
 
+form_disabled = st.session_state["timer_stopped"]  # true ถ้ากด submit แล้ว หรือหมดเวลา
+
 # ============ Modes ============
 if mode == "view":
     render_kv_grid(df_AC_RV, title="Patient", cols=2)
-    st.success("Triage completed")
-    if st.button("Triage again"):
+    if st.session_state["expired_processed"]:
+        st.error("คนไข้เสียชีวิตแล้ว")
+    else:
+        st.success("Triage completed")
+    if st.button("Triage again", disabled=form_disabled):
         st.session_state["next_after_lq"] = None
         set_query_params(row=str(display_row), mode="edit1")
         st.rerun()
@@ -468,12 +520,13 @@ elif mode == "edit2" and not has_inline_phase2:
     st.markdown("#### Secondary Triage")
     idx = ALLOWED_V.index(current_V) if current_V in ALLOWED_V else 0
     with st.form("form_v", border=True):
-        v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx)
-        submitted = st.form_submit_button("Submit")
+        v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx, disabled=form_disabled)
+        submitted = st.form_submit_button("Submit Treatment", disabled=form_disabled)
     if submitted:
         try:
             res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
             if res.get("status") == "ok":
+                st.session_state["timer_stopped"] = True  # หยุดนับเมื่อ submit treatment
                 final = res.get("final", {})
                 df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                 render_kv_grid(df_final, title="Patient", cols=2)
@@ -497,15 +550,15 @@ else:
             with l_col:
                 for i, label in enumerate(headers_LQ[:3]):
                     default = True if curr_vals[i] == "Yes" else False
-                    chk = st.checkbox(f"{label}", value=default)
+                    chk = st.checkbox(f"{label}", value=default, disabled=form_disabled)
                     selections[label] = "Yes" if chk else "No"
             with r_col:
                 for i, label in enumerate(headers_LQ[3:6], start=3):
                     default = True if curr_vals[i] == "Yes" else False
-                    chk = st.checkbox(f"{label}", value=default)
+                    chk = st.checkbox(f"{label}", value=default, disabled=form_disabled)
                     selections[label] = "Yes" if chk else "No"
 
-            submitted = st.form_submit_button("Submit")
+            submitted = st.form_submit_button("Submit", disabled=form_disabled)
 
         if submitted:
             try:
@@ -527,13 +580,14 @@ else:
         current_V2 = nxt.get("current_V", "")
         idx2 = ALLOWED_V.index(current_V2) if current_V2 in ALLOWED_V else 0
         with st.form("form_v_inline", border=True):
-            v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2)
-            v_submitted = st.form_submit_button("Submit")
+            v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2, disabled=form_disabled)
+            v_submitted = st.form_submit_button("Submit Treatment", disabled=form_disabled)
 
         if v_submitted:
             try:
                 res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                 if res2.get("status") == "ok":
+                    st.session_state["timer_stopped"] = True  # หยุดนับเมื่อ submit treatment
                     final = res2.get("final", {})
                     df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                     render_kv_grid(df_final, title="Patient", cols=2)
