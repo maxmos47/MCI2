@@ -692,7 +692,7 @@ else:
     nxt = st.session_state.get("next_after_lq")
     if nxt:
         df_ru = pd.DataFrame([nxt.get("A_C_R_U", {})])
-        render_kv_grid(df_ru, title="Patient", cols=2)
+        render_kv_grid(df_ru, title="Treatment Result", cols=2)
         st.markdown("#### Secondary Triage")
 
         if not locked:
