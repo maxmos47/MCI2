@@ -494,7 +494,6 @@ def show_lock_overlay(message: str, variant: str = "expired"):
 # =========================
 st.markdown("### 🩺 Patient Information")
 ws = open_ws()
-has_inline_phase2 = st.session_state["next_after_lq"] is not None
 
 # ---------- TIMER (GAS เป็นหลัก; fallback Secondary) ----------
 origin_seconds = 0
@@ -569,7 +568,7 @@ current_LQ = []
 current_V = ""
 
 # ===== เตรียม payload ตามโหมด =====
-if mode == "edit1" and not has_inline_phase2:
+if mode == "edit1":
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
         df_AK = pd.DataFrame([data.get("A_K", {})])
@@ -579,7 +578,7 @@ if mode == "edit1" and not has_inline_phase2:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
 
-if mode == "edit2" and not has_inline_phase2:
+if mode == "edit2":
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
         df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
@@ -611,7 +610,7 @@ if mode == "view":
         set_query_params(row=str(display_row), mode="edit1")
         st.rerun()
 
-elif mode == "edit2" and not has_inline_phase2:
+elif mode == "edit2":
     if df_AC_RU is None:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
         df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
@@ -629,15 +628,12 @@ elif mode == "edit2" and not has_inline_phase2:
             try:
                 res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                 if res.get("status") == "ok":
-                    try:
-                        gas_stop_timer(display_row)  # ถ้ามี endpoint
-                    except Exception:
-                        pass
-                    st.session_state["treated"] = True
-                    st.session_state["timer_stopped"] = True
-                    st.toast("⏸ Timer Stopped")
-                    set_query_params(row=str(display_row), mode="view")
-                    st.rerun()
+                    st.success("อัปเดตผลแล้ว")
+                    # โหลด Result ปัจจุบัน
+                    latest = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
+                    df_res = pd.DataFrame([latest.get("A_C_R_V", {})])
+                    st.markdown("#### Result")
+                    render_kv_grid(df_res, cols=2)
                 else:
                     st.error(f"Update V failed: {res}")
             except Exception as e:
@@ -646,76 +642,73 @@ elif mode == "edit2" and not has_inline_phase2:
         st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
 
 else:
-    # Phase 1: A–K + L–Q form
-    if not has_inline_phase2:
-        if df_AK is None:
-            _data_edit1 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
-            df_AK = pd.DataFrame([_data_edit1.get("A_K", {})])
-            headers_LQ = _data_edit1.get("headers_LQ", ["L","M","N","O","P","Q"])
-            current_LQ = _data_edit1.get("current_LQ", [])
+    # Phase 1: A–K + L–Q form (อนุญาตให้กดซ้ำได้ แม้มีผลลัพธ์เฟส 2 แล้ว)
+    if df_AK is None:
+        _data_edit1 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
+        df_AK = pd.DataFrame([_data_edit1.get("A_K", {})])
+        headers_LQ = _data_edit1.get("headers_LQ", ["L","M","N","O","P","Q"])
+        current_LQ = _data_edit1.get("current_LQ", [])
 
-        render_kv_grid(df_AK, title="Patient", cols=2)
-        st.markdown("#### Treatment")
+    render_kv_grid(df_AK, title="Patient", cols=2)
+    st.markdown("#### Treatment")
 
-        if not locked:
-            l_col, r_col = st.columns(2)
-            selections = {}
-            curr_vals = current_LQ if current_LQ and len(current_LQ) == 6 else ["No"] * 6
+    if not locked:
+        l_col, r_col = st.columns(2)
+        selections = {}
+        curr_vals = current_LQ if current_LQ and len(current_LQ) == 6 else ["No"] * 6
 
-            with st.form("form_lq"):
-                with l_col:
-                    for i, label in enumerate(headers_LQ[:3]):
-                        default = True if curr_vals[i] == "Yes" else False
-                        chk = st.checkbox(f"{label}", value=default)
-                        selections[label] = "Yes" if chk else "No"
-                with r_col:
-                    for i, label in enumerate(headers_LQ[3:6], start=3):
-                        default = True if curr_vals[i] == "Yes" else False
-                        chk = st.checkbox(f"{label}", value=default)
-                        selections[label] = "Yes" if chk else "No"
+        with st.form("form_lq"):
+            with l_col:
+                for i, label in enumerate(headers_LQ[:3]):
+                    default = True if curr_vals[i] == "Yes" else False
+                    chk = st.checkbox(f"{label}", value=default)
+                    selections[label] = "Yes" if chk else "No"
+            with r_col:
+                for i, label in enumerate(headers_LQ[3:6], start=3):
+                    default = True if curr_vals[i] == "Yes" else False
+                    chk = st.checkbox(f"{label}", value=default)
+                    selections[label] = "Yes" if chk else "No"
 
-                submitted = st.form_submit_button("Submit Treatment")
+            submitted = st.form_submit_button("Submit Treatment")
 
-            if submitted:
-                try:
-                    res = update_LQ(ws, sheet_row=sheet_row, lq_values=selections)
-                    if res.get("status") == "ok":
-                        st.session_state["next_after_lq"] = res.get("next", {})
-                    else:
-                        st.error(f"Update L–Q failed: {res}")
-                except Exception as e:
-                    st.error(f"Failed to update L–Q: {e}")
-        else:
-            st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
+        if submitted:
+            try:
+                res = update_LQ(ws, sheet_row=sheet_row, lq_values=selections)
+                if res.get("status") == "ok":
+                    # เก็บ payload เฟส 2 ไว้ใน session เพื่อแสดง Result ด้านล่าง
+                    st.session_state["next_after_lq"] = res.get("next", {})
+                    st.success("อัปเดต Treatment แล้ว")
+                else:
+                    st.error(f"Update L–Q failed: {res}")
+            except Exception as e:
+                st.error(f"Failed to update L–Q: {e}")
+    else:
+        st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
 
-    # Inline phase 2 after L–Q submit
+    # Inline phase 2 preview/result (แสดงทุกครั้งถ้ามี next_after_lq) และอัปเดตสดจากชีทได้
     nxt = st.session_state.get("next_after_lq")
     if nxt:
         df_ru = pd.DataFrame([nxt.get("A_C_R_U", {})])
-        render_kv_grid(df_ru, title="Treatment Result", cols=2)
-        st.markdown("#### Secondary Triage")
+        st.markdown("#### Treatment Result (Preview)")
+        render_kv_grid(df_ru, cols=2)
 
+        st.markdown("#### Secondary Triage")
         if not locked:
             current_V2 = nxt.get("current_V", "")
             idx2 = ALLOWED_V.index(current_V2) if current_V2 in ALLOWED_V else 0
             with st.form("form_v_inline"):
                 v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2)
                 v_submitted = st.form_submit_button("Submit Triage")
-
             if v_submitted:
                 try:
                     res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                     if res2.get("status") == "ok":
-                        try:
-                            gas_stop_timer(display_row)
-                        except Exception:
-                            pass
-                        st.session_state["treated"] = True
-                        st.session_state["timer_stopped"] = True
-                        st.toast("⏸ Timer Stopped")
-                        st.session_state["next_after_lq"] = None
-                        set_query_params(row=str(display_row), mode="view")
-                        st.rerun()
+                        st.success("อัปเดตผลแล้ว")
+                        # รีเฟรช preview จากชีทล่าสุด เพื่อสะท้อน R–V ปัจจุบัน
+                        latest = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
+                        df_res2 = pd.DataFrame([latest.get("A_C_R_V", {})])
+                        st.markdown("#### Result")
+                        render_kv_grid(df_res2, cols=2)
                     else:
                         st.error(f"Update V failed: {res2}")
                 except Exception as e:
