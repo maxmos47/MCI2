@@ -5,11 +5,12 @@ import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
+import requests  # ⬅️ ใช้เรียก GAS
 
 st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
 # =========================
-# CONFIG: Google Sheets
+# CONFIG: Google Sheets (ของ Secondary เอง)
 # =========================
 SPREADSHEET_ID = (st.secrets.get("gsheets", {}).get("spreadsheet_id", "") or "").strip()
 WORKSHEET_NAME = st.secrets.get("gsheets", {}).get("worksheet_name", "Secondary")
@@ -212,17 +213,42 @@ def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
                 )
 
 # =========================
-# Timer helpers (Q origin sec, R t0_epoch, S end_epoch)
+# GAS helpers (ใช้ข้อมูลเวลาเดียวกับ Primary)
+# =========================
+def gas_get_row(row: int) -> dict:
+    url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not url:
+        return {}
+    params = {"action": "get", "row": str(row)}
+    tok = st.secrets.get("gas", {}).get("token", "")
+    if tok:
+        params["token"] = tok
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def gas_start_timer(row: int) -> dict:
+    url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not url:
+        return {}
+    data = {"action": "start_timer", "row": str(row)}
+    tok = st.secrets.get("gas", {}).get("token", "")
+    if tok:
+        data["token"] = tok
+    r = requests.post(url, data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+# =========================
+# Timer helpers (fallback อ่านจากชีท Secondary ถ้าไม่มี GAS)
 # =========================
 def parse_seconds(value) -> int:
     """รองรับ: 120, '120', '02:00', '00:01:30' และกรณี numeric day-fraction ของ Google Sheets"""
     try:
         if value is None or value == "":
             return 0
-        # date-like (กันเผื่อ กรณี gspread แปลงเป็น datetime)
         if hasattr(value, "hour") and hasattr(value, "minute") and hasattr(value, "second"):
             return max(0, int(value.hour) * 3600 + int(value.minute) * 60 + int(value.second))
-        # number (seconds หรือ day-fraction)
         if isinstance(value, (int, float)):
             if 0 < float(value) < 2:
                 return max(0, int(round(float(value) * 86400)))
@@ -265,13 +291,9 @@ def read_timer_state(ws, sheet_row: int) -> dict:
     return {"origin": origin, "t0_epoch": t0_epoch, "end_epoch": end_epoch}
 
 def start_timer_if_needed(ws, sheet_row: int, origin: int, t0_epoch: int, end_epoch: int) -> Tuple[int, int]:
-    """
-    เริ่มตั้ง R(t0) และ S(end) ถ้ายังไม่ตั้ง (idempotent)
-    คืนค่า (t0_epoch, end_epoch) ที่อัปเดตแล้ว
-    """
+    """ตั้งค่า R/S ครั้งแรก (idempotent) บนชีท Secondary (fallback เท่านั้น)"""
     if origin <= 0:
         return t0_epoch, end_epoch
-
     if t0_epoch > 0 and end_epoch > 0:
         return t0_epoch, end_epoch
 
@@ -364,26 +386,47 @@ sheet_row = display_row + 1  # shift by 1 so that "row=1" targets sheet row 2
 ws = open_ws()
 has_inline_phase2 = st.session_state["next_after_lq"] is not None
 
-# ---------- TIMER: อ่าน/ตั้งค่า และแสดงเคาน์ดาวน์ ----------
+# ---------- TIMER (ใช้ GAS เป็นหลัก; fallback ชีท Secondary) ----------
+origin_seconds = 0
+t0_epoch = 0
+end_epoch = 0
+
+# 1) พยายามอ่านจาก GAS (ชีท Primary)
 try:
-    ts = read_timer_state(ws, sheet_row)
-    origin_seconds = int(ts["origin"])
-    t0_epoch = int(ts["t0_epoch"])
-    end_epoch = int(ts["end_epoch"])
+    g = gas_get_row(row=display_row)
+    if g and g.get("status") == "ok":
+        origin_seconds = int(g.get("timer_seconds", 0) or 0)
+        t0_epoch = int(g.get("t0_epoch", 0) or 0)
+        end_epoch = int(g.get("end_epoch", 0) or 0)
 
-    # ถ้ายังไม่เริ่ม แต่ Q > 0 -> เริ่ม (เขียน R,S)
-    if origin_seconds > 0 and end_epoch == 0:
-        t0_epoch, end_epoch = start_timer_if_needed(ws, sheet_row, origin_seconds, t0_epoch, end_epoch)
-
-    now = int(pd.Timestamp.utcnow().timestamp())
-    remaining = max(0, end_epoch - now) if end_epoch else 0
-
-    render_countdown(origin_seconds, remaining)
-
-    if origin_seconds == 0:
-        st.info("Timer: ค่า Q ไม่ถูกต้องหรือเป็นค่าว่าง (รองรับ 120, '02:00', '00:01:30' หรือเวลาแบบ day-fraction)")
+        # ถ้า Q>0 แต่ยังไม่ set R/S → เริ่มที่ GAS (idempotent)
+        if origin_seconds > 0 and end_epoch == 0:
+            s = gas_start_timer(row=display_row)
+            if s.get("status") == "ok":
+                t0_epoch = int(s.get("t0_epoch", t0_epoch) or 0)
+                end_epoch = int(s.get("end_epoch", end_epoch) or 0)
 except Exception as e:
-    st.warning(f"Timer error: {e}")
+    st.warning(f"GAS error, fallback to sheet: {e}")
+
+# 2) ถ้ายังไม่มี end_epoch จาก GAS → fallback: อ่านจากชีท Secondary
+if end_epoch == 0:
+    try:
+        ts = read_timer_state(ws, sheet_row)
+        origin_seconds = origin_seconds or int(ts["origin"])
+        t0_epoch = t0_epoch or int(ts["t0_epoch"])
+        end_epoch = end_epoch or int(ts["end_epoch"])
+        if origin_seconds > 0 and end_epoch == 0:
+            t0_epoch, end_epoch = start_timer_if_needed(ws, sheet_row, origin_seconds, t0_epoch, end_epoch)
+    except Exception as e:
+        st.warning(f"Sheet timer fallback error: {e}")
+
+# คำนวณเวลาที่เหลือจาก end_epoch
+now = int(pd.Timestamp.utcnow().timestamp())
+remaining = max(0, end_epoch - now) if end_epoch else 0
+render_countdown(origin_seconds, remaining)
+
+if origin_seconds == 0 and end_epoch == 0:
+    st.info("Secondary ไม่เจอสถานะเวลาใน GAS/ชีท: ตรวจ row หรือ [gas].webapp_url/token ใน secrets และว่าฝั่ง Primary ได้ตั้ง Q/R/S แล้ว")
 
 # Prepare dataframes by mode
 if mode == "edit1" and not has_inline_phase2:
