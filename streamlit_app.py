@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-import requests  # ใช้เรียก GAS
+import requests  # เรียก GAS
 
 st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
@@ -64,9 +64,9 @@ if "next_after_lq" not in st.session_state:
 
 # Timer state flags
 if "timer_stopped" not in st.session_state:
-    st.session_state["timer_stopped"] = False  # หยุดนับเพราะกด Submit Treatment หรือหมดเวลา
+    st.session_state["timer_stopped"] = False  # หยุดนับเพราะ submit/หมดเวลา
 if "expired_processed" not in st.session_state:
-    st.session_state["expired_processed"] = False  # กันการเพิ่ม Z ซ้ำเมื่อหมดเวลา
+    st.session_state["expired_processed"] = False  # กันเพิ่ม Z ซ้ำ
 
 # =========================
 # Helpers for query params
@@ -190,6 +190,51 @@ def increment_Z(ws, sheet_row: int) -> int:
     return new_val
 
 # =========================
+# Card UI (mobile-friendly)
+# =========================
+st.markdown("""
+<style>
+.kv-card{border:1px solid #e5e7eb;padding:12px;border-radius:14px;margin-bottom:10px;box-shadow:0 1px 4px rgba(0,0,0,0.06);background:#fff;}
+.kv-label{font-size:0.9rem;color:#6b7280;margin-bottom:2px;}
+.kv-value{font-size:1.05rem;font-weight:600;word-break:break-word;}
+@media (max-width: 640px){
+  .kv-card{padding:12px;}
+  .kv-value{font-size:1.06rem;}
+}
+</style>
+""", unsafe_allow_html=True)
+
+def _pairs_from_row(df_one_row: pd.DataFrame) -> List[Tuple[str, str]]:
+    s = df_one_row.iloc[0]
+    pairs: List[Tuple[str, str]] = []
+    for col in df_one_row.columns:
+        val = s[col]
+        if pd.isna(val):
+            val = ""
+        pairs.append((str(col), str(val)))
+    return pairs
+
+def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
+    if title:
+        st.subheader(title)
+    items = _pairs_from_row(df_one_row)
+    n = len(items)
+    for i in range(0, n, cols):
+        row_items = items[i:i+cols]
+        col_objs = st.columns(len(row_items))
+        for c, (label, value) in zip(col_objs, row_items):
+            with c:
+                st.markdown(
+                    f"""
+                    <div class="kv-card">
+                      <div class="kv-label">{label}</div>
+                      <div class="kv-value">{value if value!='' else '-'}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+# =========================
 # GAS helpers (ใช้ข้อมูลเวลาเดียวกับ Primary)
 # =========================
 def gas_get_row(row: int) -> dict:
@@ -230,7 +275,6 @@ def gas_stop_timer(row: int) -> dict:
     if tok:
         data["token"] = tok
     r = requests.post(url, data=data, timeout=20)
-    # บางโปรเจ็กต์อาจยังไม่มี stop_timer → ไม่ raise เพื่อไม่ให้ UX สะดุด
     try:
         r.raise_for_status()
         return r.json()
@@ -453,7 +497,7 @@ if (remaining <= 0) and (not st.session_state["expired_processed"]):
     st.session_state["expired_processed"] = True
     st.session_state["timer_stopped"] = True
     st.error("คนไข้เสียชีวิตแล้ว")
-    st.rerun()  # รีเฟรชฝั่งเซิร์ฟเวอร์
+    st.rerun()  # รีเฟรชฝั่งเซิร์ฟเวอร์เพื่อซ่อนกล่องทันที
 
 # ===== แสดง/ซ่อนตัวจับเวลา =====
 show_timer = not (st.session_state["timer_stopped"] or st.session_state["expired_processed"])
@@ -461,37 +505,48 @@ if show_timer:
     render_countdown(origin_seconds, remaining, paused=False)
 # (ถ้าไม่ show_timer → ไม่วาดกล่อง)
 
-# ===== เตรียม DataFrames แต่ละโหมด =====
+# ---------------- Defaults to avoid NameError ----------------
+df_AK = None
+df_AC_RU = None
+df_AC_RV = None
+headers_LQ = ["L","M","N","O","P","Q"]
+current_LQ = []
+current_V = ""
+
+# ===== เตรียม DataFrames แต่ละโหมด (ถ้ายังไม่มี) =====
 if mode == "edit1" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
+        df_AK = pd.DataFrame([data.get("A_K", {})])
+        headers_LQ = data.get("headers_LQ", headers_LQ)
+        current_LQ = data.get("current_LQ", current_LQ)
     except Exception as e:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
-    df_AK = pd.DataFrame([data.get("A_K", {})])
-    headers_LQ = data.get("headers_LQ", ["L","M","N","O","P","Q"])
-    current_LQ = data.get("current_LQ", [])
+
 elif mode == "edit2" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
+        df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
+        current_V = data.get("current_V", current_V)
     except Exception as e:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
-    df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
-    current_V = data.get("current_V", "")
+
 elif mode == "view":
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
+        df_AC_RV = pd.DataFrame([data.get("A_C_R_V", {})])
     except Exception as e:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
-    df_AC_RV = pd.DataFrame([data.get("A_C_R_V", {})])
 
 form_disabled = st.session_state["timer_stopped"]  # true ถ้ากด submit แล้ว หรือหมดเวลา
 
 # ============ Modes ============
 if mode == "view":
-    render_kv_grid(df_AC_RV, title="Patient", cols=2)
+    if df_AC_RV is not None:
+        render_kv_grid(df_AC_RV, title="Patient", cols=2)
     if st.session_state["expired_processed"]:
         st.error("คนไข้เสียชีวิตแล้ว")
     else:
@@ -502,6 +557,12 @@ if mode == "view":
         st.rerun()
 
 elif mode == "edit2" and not has_inline_phase2:
+    if df_AC_RU is None:
+        # กันเหนียว
+        data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
+        df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
+        current_V = data.get("current_V", current_V)
+
     render_kv_grid(df_AC_RU, title="Patient", cols=2)
     st.markdown("#### Secondary Triage")
     idx = ALLOWED_V.index(current_V) if current_V in ALLOWED_V else 0
@@ -512,7 +573,7 @@ elif mode == "edit2" and not has_inline_phase2:
         try:
             res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
             if res.get("status") == "ok":
-                # หยุดเวลา (GAS ถ้ามี endpoint; ถ้าไม่มีจะข้ามไป)
+                # หยุดเวลา (GAS ถ้ามี endpoint; ถ้าไม่มีจะข้าม)
                 try:
                     gas_stop_timer(display_row)
                 except Exception:
@@ -533,6 +594,18 @@ elif mode == "edit2" and not has_inline_phase2:
 else:
     # Phase 1: A–K + L–Q form
     if not has_inline_phase2:
+        # --- ENSURE df_AK, headers_LQ, current_LQ are present ---
+        if df_AK is None:
+            try:
+                _data_edit1 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
+                df_AK = pd.DataFrame([_data_edit1.get("A_K", {})])
+                headers_LQ = _data_edit1.get("headers_LQ", headers_LQ)
+                current_LQ = _data_edit1.get("current_LQ", current_LQ)
+            except Exception as e:
+                st.error(f"Failed to read sheet (edit1): {e}")
+                st.stop()
+        # ---------------------------------------------------------
+
         render_kv_grid(df_AK, title="Patient", cols=2)
         st.markdown("#### Treatment")
         l_col, r_col = st.columns(2)
