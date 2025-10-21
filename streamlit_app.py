@@ -64,7 +64,7 @@ if "next_after_lq" not in st.session_state:
 
 # Timer state flags
 if "timer_stopped" not in st.session_state:
-    st.session_state["timer_stopped"] = False  # หยุดนับเพราะกด Submit Treatment
+    st.session_state["timer_stopped"] = False  # หยุดนับเพราะกด Submit Treatment หรือหมดเวลา
 if "expired_processed" not in st.session_state:
     st.session_state["expired_processed"] = False  # กันการเพิ่ม Z ซ้ำเมื่อหมดเวลา
 
@@ -190,51 +190,6 @@ def increment_Z(ws, sheet_row: int) -> int:
     return new_val
 
 # =========================
-# Card UI (mobile-friendly)
-# =========================
-st.markdown("""
-<style>
-.kv-card{border:1px solid #e5e7eb;padding:12px;border-radius:14px;margin-bottom:10px;box-shadow:0 1px 4px rgba(0,0,0,0.06);background:#fff;}
-.kv-label{font-size:0.9rem;color:#6b7280;margin-bottom:2px;}
-.kv-value{font-size:1.05rem;font-weight:600;word-break:break-word;}
-@media (max-width: 640px){
-  .kv-card{padding:12px;}
-  .kv-value{font-size:1.06rem;}
-}
-</style>
-""", unsafe_allow_html=True)
-
-def _pairs_from_row(df_one_row: pd.DataFrame) -> List[Tuple[str, str]]:
-    s = df_one_row.iloc[0]
-    pairs: List[Tuple[str, str]] = []
-    for col in df_one_row.columns:
-        val = s[col]
-        if pd.isna(val):
-            val = ""
-        pairs.append((str(col), str(val)))
-    return pairs
-
-def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
-    if title:
-        st.subheader(title)
-    items = _pairs_from_row(df_one_row)
-    n = len(items)
-    for i in range(0, n, cols):
-        row_items = items[i:i+cols]
-        col_objs = st.columns(len(row_items))
-        for c, (label, value) in zip(col_objs, row_items):
-            with c:
-                st.markdown(
-                    f"""
-                    <div class="kv-card">
-                      <div class="kv-label">{label}</div>
-                      <div class="kv-value">{value if value!='' else '-'}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-# =========================
 # GAS helpers (ใช้ข้อมูลเวลาเดียวกับ Primary)
 # =========================
 def gas_get_row(row: int) -> dict:
@@ -246,7 +201,11 @@ def gas_get_row(row: int) -> dict:
     if tok:
         params["token"] = tok
     r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except Exception as e:
+        st.error(f"GAS HTTP error: {e}\nResponse: {r.text}")
+        raise
     return r.json()
 
 def gas_start_timer(row: int) -> dict:
@@ -261,11 +220,28 @@ def gas_start_timer(row: int) -> dict:
     r.raise_for_status()
     return r.json()
 
+def gas_stop_timer(row: int) -> dict:
+    """ถ้ามี endpoint stop_timer จะหยุดที่ต้นทางด้วย; ถ้าไม่มีจะไม่ error"""
+    url = st.secrets.get("gas", {}).get("webapp_url", "")
+    if not url:
+        return {}
+    data = {"action": "stop_timer", "row": str(row)}
+    tok = st.secrets.get("gas", {}).get("token", "")
+    if tok:
+        data["token"] = tok
+    r = requests.post(url, data=data, timeout=20)
+    # บางโปรเจ็กต์อาจยังไม่มี stop_timer → ไม่ raise เพื่อไม่ให้ UX สะดุด
+    try:
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {"status": "noop"}
+
 # =========================
 # Timer helpers (fallback อ่านจากชีท Secondary ถ้าไม่มี GAS)
 # =========================
 def parse_seconds(value) -> int:
-    """รองรับ: 120, '120', '02:00', '00:01:30' และกรณี numeric day-fraction ของ Google Sheets"""
+    """รองรับ: 120, '120', '02:00', '00:01:30' และ numeric day-fraction ของ Google Sheets"""
     try:
         if value is None or value == "":
             return 0
@@ -341,30 +317,29 @@ def fmt_hms(secs: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
-    """โชว์ตัวเลข HH:MM:SS + progress bar; ถ้า paused=True จะไม่รัน JS (แช่ภาพ)"""
+    """
+    โชว์ตัวเลข HH:MM:SS + progress; ถ้า paused=True จะไม่แสดงกล่อง (ซ่อนทันที)
+    ระหว่างนับ: เมื่อถึง 0 จะซ่อนและ reload หน้าอัตโนมัติ
+    """
     import streamlit.components.v1 as components
-    initial_digits = fmt_hms(remaining)
+
+    if paused:
+        # ซ่อนกล่องไปเลยเมื่อหยุด/หมดเวลา
+        return
+
+    def _fmt(secs: int) -> str:
+        secs = max(0, int(secs))
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    initial_digits = _fmt(remaining)
     progress_value = max(0, (origin_seconds - remaining) if origin_seconds else 0)
     progress_max = max(1, origin_seconds if origin_seconds > 0 else 1)
 
-    if paused:
-        components.html(
-            f"""
-            <div style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
-              <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏸ Stopped</span>
-              <span id="digits" style="font-weight:800;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
-              <div style="margin-top:10px">
-                <progress id="pg" max="{progress_max}" value="{progress_value}" style="width:100%"></progress>
-              </div>
-            </div>
-            """,
-            height=160,
-        )
-        return
-
     components.html(
         f"""
-        <div style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
+        <div id="timerWrap" style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
           <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏳ Server timer</span>
           <span id="digits" style="font-weight:800;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
           <div style="margin-top:10px">
@@ -377,6 +352,7 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
             const origin = {origin_seconds};
             const digits = document.getElementById('digits');
             const pg = document.getElementById('pg');
+            const wrap = document.getElementById('timerWrap');
             function fmt(n) {{ return String(n).padStart(2,'0'); }}
             function render() {{
               let s = Math.max(0, Math.floor(remaining));
@@ -392,7 +368,14 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
             render();
             const intv = setInterval(() => {{
               remaining -= 1;
-              if (remaining <= 0) {{ remaining = 0; render(); clearInterval(intv); return; }}
+              if (remaining <= 0) {{
+                remaining = 0;
+                render();
+                clearInterval(intv);
+                if (wrap) wrap.style.display = 'none'; // ซ่อน
+                setTimeout(() => window.location.reload(), 50); // รีเฟรชหน้า
+                return;
+              }}
               render();
             }}, 1000);
           }})();
@@ -457,25 +440,28 @@ if end_epoch == 0:
     except Exception as e:
         st.warning(f"Sheet timer fallback error: {e}")
 
-# คำนวณเวลาที่เหลือจาก end_epoch
+# ===== คำนวณเวลาที่เหลือ =====
 now = int(pd.Timestamp.utcnow().timestamp())
 remaining = max(0, end_epoch - now) if end_epoch else 0
 
-# แสดง countdown (หยุดถ้ากด Submit Treatment ไปแล้ว)
-render_countdown(origin_seconds, remaining, paused=st.session_state["timer_stopped"])
-
-# ถ้าหมดเวลา แล้วยังไม่เคยประมวลผล "เสียชีวิต"
+# ===== ถ้าหมดเวลา แล้วยังไม่เคยประมวลผล → เพิ่ม Z + ล็อก + รีเฟรชทันที =====
 if (remaining <= 0) and (not st.session_state["expired_processed"]):
     try:
         _newz = increment_Z(ws, sheet_row)
-        st.session_state["expired_processed"] = True
-        st.error("คนไข้เสียชีวิตแล้ว")
     except Exception as e:
         st.warning(f"ไม่สามารถอัปเดตคอลัมน์ Z ได้: {e}")
-    # ล็อกฟอร์มทันที
+    st.session_state["expired_processed"] = True
     st.session_state["timer_stopped"] = True
+    st.error("คนไข้เสียชีวิตแล้ว")
+    st.rerun()  # รีเฟรชฝั่งเซิร์ฟเวอร์
 
-# Prepare dataframes by mode
+# ===== แสดง/ซ่อนตัวจับเวลา =====
+show_timer = not (st.session_state["timer_stopped"] or st.session_state["expired_processed"])
+if show_timer:
+    render_countdown(origin_seconds, remaining, paused=False)
+# (ถ้าไม่ show_timer → ไม่วาดกล่อง)
+
+# ===== เตรียม DataFrames แต่ละโหมด =====
 if mode == "edit1" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
@@ -526,12 +512,19 @@ elif mode == "edit2" and not has_inline_phase2:
         try:
             res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
             if res.get("status") == "ok":
-                st.session_state["timer_stopped"] = True  # หยุดนับเมื่อ submit treatment
+                # หยุดเวลา (GAS ถ้ามี endpoint; ถ้าไม่มีจะข้ามไป)
+                try:
+                    gas_stop_timer(display_row)
+                except Exception:
+                    pass
+                # หยุด UI + แจ้งเตือน + ไปหน้า view
+                st.session_state["timer_stopped"] = True
+                st.toast("⏸ Timer Stopped")
                 final = res.get("final", {})
                 df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                 render_kv_grid(df_final, title="Patient", cols=2)
-                st.success("Saved. Final view (no form).")
                 set_query_params(row=str(display_row), mode="view")
+                st.rerun()  # รีเฟรชทันทีหลัง submit
             else:
                 st.error(f"Update V failed: {res}")
         except Exception as e:
@@ -587,13 +580,20 @@ else:
             try:
                 res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                 if res2.get("status") == "ok":
-                    st.session_state["timer_stopped"] = True  # หยุดนับเมื่อ submit treatment
+                    # หยุดเวลา (GAS ถ้ามี endpoint)
+                    try:
+                        gas_stop_timer(display_row)
+                    except Exception:
+                        pass
+                    # หยุด UI + แจ้งเตือน + ไปหน้า view
+                    st.session_state["timer_stopped"] = True
+                    st.toast("⏸ Timer Stopped")
                     final = res2.get("final", {})
                     df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                     render_kv_grid(df_final, title="Patient", cols=2)
-                    st.success("Triage เรียบร้อย")
                     st.session_state["next_after_lq"] = None
                     set_query_params(row=str(display_row), mode="view")
+                    st.rerun()
                 else:
                     st.error(f"Update V failed: {res2}")
             except Exception as e:
