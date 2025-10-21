@@ -494,6 +494,7 @@ def show_lock_overlay(message: str, variant: str = "expired"):
 # =========================
 st.markdown("### 🩺 Patient Information")
 ws = open_ws()
+has_inline_phase2 = st.session_state["next_after_lq"] is not None
 
 # ---------- TIMER (GAS เป็นหลัก; fallback Secondary) ----------
 origin_seconds = 0
@@ -568,7 +569,7 @@ current_LQ = []
 current_V = ""
 
 # ===== เตรียม payload ตามโหมด =====
-if mode == "edit1":
+if mode == "edit1" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
         df_AK = pd.DataFrame([data.get("A_K", {})])
@@ -578,7 +579,7 @@ if mode == "edit1":
         st.error(f"Failed to read sheet: {e}")
         st.stop()
 
-if mode == "edit2":
+if mode == "edit2" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
         df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
@@ -592,4 +593,161 @@ if mode == "view":
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
         df_AC_RV = pd.DataFrame([data.get("A_C_R_V", {})])
     except Exception as e:
-        st.error(f"Failed to read sheet: {
+        st.error(f"Failed to read sheet: {e}")
+        st.stop()
+
+# ============ Modes ============
+if mode == "view":
+    if df_AC_RV is not None:
+        render_kv_grid(df_AC_RV, title="Patient", cols=2)
+    if treated:
+        st.success("คนไข้ได้รับการรักษาแล้ว")
+    elif st.session_state["expired_processed"]:
+        st.error("คนไข้เสียชีวิตแล้ว")
+    else:
+        st.success("Triage completed")
+    # เมื่อถูกล็อกแล้ว จะไม่มีปุ่มแก้ไขใดๆ
+
+elif mode == "edit2" and not has_inline_phase2:
+    if df_AC_RU is None:
+        data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
+        df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
+        current_V = data.get("current_V", current_V)
+
+    render_kv_grid(df_AC_RU, title="Patient", cols=2)
+    st.markdown("#### Secondary Triage")
+
+    if not locked:
+        idx = ALLOWED_V.index(current_V) if current_V in ALLOWED_V else 0
+        # ฟอร์มสำหรับ "Submit Treatment" (อัปเดตผลได้หลายครั้ง)
+        with st.form("form_v"):
+            v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx)
+            submitted_update = st.form_submit_button("Submit Treatment")
+        if submitted_update:
+            try:
+                res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
+                if res.get("status") == "ok":
+                    st.success("อัปเดตผลการรักษาแล้ว")
+                    # แสดงผลปัจจุบัน
+                    latest = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
+                    df_res = pd.DataFrame([latest.get("A_C_R_V", {})])
+                    st.markdown("#### Result")
+                    render_kv_grid(df_res, cols=2)
+                else:
+                    st.error(f"Update V failed: {res}")
+            except Exception as e:
+                st.error(f"Failed to update V: {e}")
+
+        # ปุ่ม Finalize: "Submit Triage" (ครั้งเดียว → หยุดเวลา + ล็อก)
+        if st.button("Submit Triage", disabled=st.session_state["treated"]):
+            try:
+                # เซฟค่าปัจจุบันอีกครั้งเพื่อความแน่ใจ
+                cur_v = v_value if 'v_value' in locals() else current_V
+                if cur_v:
+                    update_V(ws, sheet_row=sheet_row, v_value=cur_v)
+                try:
+                    gas_stop_timer(display_row)
+                except Exception:
+                    pass
+                st.session_state["treated"] = True
+                st.session_state["timer_stopped"] = True
+                set_query_params(row=str(display_row), mode="view")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Finalize failed: {e}")
+    else:
+        st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
+
+else:
+    # Phase 1: A–K + L–Q form
+    if not has_inline_phase2:
+        if df_AK is None:
+            _data_edit1 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
+            df_AK = pd.DataFrame([_data_edit1.get("A_K", {})])
+            headers_LQ = _data_edit1.get("headers_LQ", ["L","M","N","O","P","Q"])
+            current_LQ = _data_edit1.get("current_LQ", [])
+
+        render_kv_grid(df_AK, title="Patient", cols=2)
+        st.markdown("#### Treatment")
+
+        if not locked:
+            l_col, r_col = st.columns(2)
+            selections = {}
+            curr_vals = current_LQ if current_LQ and len(current_LQ) == 6 else ["No"] * 6
+
+            # ปุ่ม "Submit Treatment" เพื่ออัปเดต L–Q และโหลดผล (edit2) แบบ inline
+            with st.form("form_lq"):
+                with l_col:
+                    for i, label in enumerate(headers_LQ[:3]):
+                        default = True if curr_vals[i] == "Yes" else False
+                        chk = st.checkbox(f"{label}", value=default)
+                        selections[label] = "Yes" if chk else "No"
+                with r_col:
+                    for i, label in enumerate(headers_LQ[3:6], start=3):
+                        default = True if curr_vals[i] == "Yes" else False
+                        chk = st.checkbox(f"{label}", value=default)
+                        selections[label] = "Yes" if chk else "No"
+
+                submitted = st.form_submit_button("Submit Treatment")
+
+            if submitted:
+                try:
+                    res = update_LQ(ws, sheet_row=sheet_row, lq_values=selections)
+                    if res.get("status") == "ok":
+                        st.session_state["next_after_lq"] = res.get("next", {})
+                    else:
+                        st.error(f"Update L–Q failed: {res}")
+                except Exception as e:
+                    st.error(f"Failed to update L–Q: {e}")
+        else:
+            st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
+
+    # Inline phase 2 after L–Q submit (แก้/อัปเดตได้หลายครั้ง จนกว่าจะกด Submit Triage)
+    nxt = st.session_state.get("next_after_lq")
+    if nxt:
+        df_ru = pd.DataFrame([nxt.get("A_C_R_U", {})])
+        render_kv_grid(df_ru, title="Treatment Result", cols=2)
+        st.markdown("#### Secondary Triage")
+
+        if not locked:
+            current_V2 = nxt.get("current_V", "")
+            idx2 = ALLOWED_V.index(current_V2) if current_V2 in ALLOWED_V else 0
+
+            # ฟอร์มสำหรับอัปเดตผลหลายครั้ง
+            with st.form("form_v_inline"):
+                v_value2 = st.selectbox("Select Triage priority", ALLOWED_V, index=idx2, key="v_inline")
+                v_submitted = st.form_submit_button("Submit Treatment")
+
+            if v_submitted:
+                try:
+                    res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value2)
+                    if res2.get("status") == "ok":
+                        st.success("อัปเดตผลการรักษาแล้ว")
+                        latest2 = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
+                        df_res2 = pd.DataFrame([latest2.get("A_C_R_V", {})])
+                        st.markdown("#### Result")
+                        render_kv_grid(df_res2, cols=2)
+                    else:
+                        st.error(f"Update V failed: {res2}")
+                except Exception as e:
+                    st.error(f"Failed to update V: {e}")
+
+            # ปุ่ม Finalize: กดได้ครั้งเดียว → หยุดเวลา + ล็อก
+            if st.button("Submit Triage", disabled=st.session_state["treated"]):
+                try:
+                    cur_v2 = v_value2 if 'v_value2' in locals() else current_V2
+                    if cur_v2:
+                        update_V(ws, sheet_row=sheet_row, v_value=cur_v2)
+                    try:
+                        gas_stop_timer(display_row)
+                    except Exception:
+                        pass
+                    st.session_state["treated"] = True
+                    st.session_state["timer_stopped"] = True
+                    st.session_state["next_after_lq"] = None
+                    set_query_params(row=str(display_row), mode="view")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Finalize failed: {e}")
+        else:
+            st.info("หน้าถูกล็อกเนื่องจากหมดเวลา/ปิดการรักษาแล้ว")
