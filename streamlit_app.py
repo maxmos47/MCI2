@@ -389,8 +389,8 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
     components.html(
         f"""
         <div id="timerWrap" style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
-          <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏳ คนไข้กำลังจะเสียชีวิต</span>
-          <span id="digits" style="font-weight:800;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
+          <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏳ คนไข้กำลังจะเสียชีวิตใน</span>
+          <span id="digits" style="font-weight:600;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
           <div style="margin-top:10px">
             <progress id="pg" max="{progress_max}" value="{progress_value}" style="width:100%"></progress>
           </div>
