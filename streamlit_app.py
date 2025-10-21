@@ -513,7 +513,18 @@ headers_LQ = ["L","M","N","O","P","Q"]
 current_LQ = []
 current_V = ""
 
+# # ---------------- Defaults to avoid NameError ----------------
+df_AK = None
+df_AC_RU = None
+df_AC_RV = None
+headers_LQ = ["L","M","N","O","P","Q"]
+current_LQ = []
+current_V = ""
+
 # ===== เตรียม DataFrames แต่ละโหมด (ถ้ายังไม่มี) =====
+# ใช้ if แยกเป็นก้อน ๆ (เลี่ยง elif) เพื่อกัน SyntaxError เวลามีโค้ดอื่นคั่นกลาง
+
+# edit1: A–K + L–Q
 if mode == "edit1" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
@@ -524,7 +535,8 @@ if mode == "edit1" and not has_inline_phase2:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
 
-elif mode == "edit2" and not has_inline_phase2:
+# edit2: R–U + V
+if mode == "edit2" and not has_inline_phase2:
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
         df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
@@ -533,15 +545,14 @@ elif mode == "edit2" and not has_inline_phase2:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
 
-elif mode == "view":
+# view: A–C + R–V
+if mode == "view":
     try:
         data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
         df_AC_RV = pd.DataFrame([data.get("A_C_R_V", {})])
     except Exception as e:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
-
-form_disabled = st.session_state["timer_stopped"]  # true ถ้ากด submit แล้ว หรือหมดเวลา
 
 # ============ Modes ============
 if mode == "view":
