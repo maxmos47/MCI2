@@ -389,7 +389,7 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
     components.html(
         f"""
         <div id="timerWrap" style="border:1px dashed #94a3b8;padding:12px;border-radius:12px;background:#f8fafc">
-          <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏳ Server timer</span>
+          <span style="font-size:0.8rem;background:#e2e8f0;border-radius:999px;padding:4px 10px;color:#334155;margin-right:10px">⏳ คนไข้กำลังจะเสียชีวิต</span>
           <span id="digits" style="font-weight:800;letter-spacing:1px;line-height:1;font-size:2.6rem">{initial_digits}</span>
           <div style="margin-top:10px">
             <progress id="pg" max="{progress_max}" value="{progress_value}" style="width:100%"></progress>
@@ -624,7 +624,7 @@ elif mode == "edit2" and not has_inline_phase2:
         idx = ALLOWED_V.index(current_V) if current_V in ALLOWED_V else 0
         with st.form("form_v"):
             v_value = st.selectbox("Select Triage priority", ALLOWED_V, index=idx)
-            submitted = st.form_submit_button("Submit Treatment")
+            submitted = st.form_submit_button("Submit Triage")
         if submitted:
             try:
                 res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
@@ -674,7 +674,7 @@ else:
                         chk = st.checkbox(f"{label}", value=default)
                         selections[label] = "Yes" if chk else "No"
 
-                submitted = st.form_submit_button("Submit")
+                submitted = st.form_submit_button("Submit Treatment")
 
             if submitted:
                 try:
