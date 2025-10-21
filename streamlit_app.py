@@ -369,15 +369,17 @@ def start_timer_if_needed(ws, sheet_row: int, origin: int, t0_epoch: int, end_ep
     return t0, end_
 
 def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
-    """โชว์นับถอยหลัง; เมื่อถึง 0 → ซ่อนและ reload หน้า, paused=True → ไม่วาดอะไร (ซ่อน)"""
+    """โชว์นับถอยหลัง; เมื่อถึง 0 → ซ่อนและ reload หน้า (ทั้งแอป), paused=True → ไม่วาดอะไร (ซ่อน)"""
     import streamlit.components.v1 as components
     if paused:
         return
+
     def _fmt(secs: int) -> str:
         secs = max(0, int(secs))
         h, rem = divmod(secs, 3600)
         m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
+
     initial_digits = _fmt(remaining)
     progress_value = max(0, (origin_seconds - remaining) if origin_seconds else 0)
     progress_max = max(1, origin_seconds if origin_seconds > 0 else 1)
@@ -398,18 +400,32 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
             const digits = document.getElementById('digits');
             const pg = document.getElementById('pg');
             const wrap = document.getElementById('timerWrap');
+
             function fmt(n) {{ return String(n).padStart(2,'0'); }}
             function render() {{
               let s = Math.max(0, Math.floor(remaining));
               let h = Math.floor(s/3600);
               let m = Math.floor((s%3600)/60);
               let ss = s%60;
-              digits.textContent = `${{fmt(h)}}:${{fmt(m)}}:${{fmt(ss)}}`;
+              if (digits) digits.textContent = `${{fmt(h)}}:${{fmt(m)}}:${{fmt(ss)}}`;
               if (origin > 0 && pg) {{
                 pg.max = origin;
                 pg.value = Math.min(origin, Math.max(0, origin - s));
               }}
             }}
+
+            function hardReloadParent() {{
+              try {{
+                // 1) ขอให้ Streamlit rerun (บาง environment รองรับ)
+                window.parent.postMessage({{is_streamlit_message: true, type: "streamlit:rerun"}}, "*");
+              }} catch (e) {{}}
+              try {{
+                // 2) บังคับ reload ทั้งหน้า (ไม่ใช่แค่ iframe)
+                const p = window.parent || window.top || window;
+                p.location.reload();
+              }} catch (e) {{}}
+            }}
+
             render();
             const intv = setInterval(() => {{
               remaining -= 1;
@@ -417,8 +433,8 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
                 remaining = 0;
                 render();
                 clearInterval(intv);
-                if (wrap) wrap.style.display = 'none';
-                setTimeout(() => window.location.reload(), 50);
+                if (wrap) wrap.style.display = 'none'; // ซ่อนกล่องทันที
+                setTimeout(hardReloadParent, 50);       // รีเฟรชทั้งหน้า
                 return;
               }}
               render();
