@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-import requests  # เรียก GAS (Primary timer)
+import requests  # ใช้เรียก GAS (Primary timer)
 
 st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
@@ -21,14 +21,16 @@ SCOPES = [
 ]
 
 # =========================
-# Session flags (timer / expiry)
+# Session flags (timer / expiry / treated)
 # =========================
 if "next_after_lq" not in st.session_state:
     st.session_state["next_after_lq"] = None
 if "timer_stopped" not in st.session_state:
-    st.session_state["timer_stopped"] = False  # หยุดแล้ว (จาก submit หรือหมดเวลา)
+    st.session_state["timer_stopped"] = False  # หยุดนับเพราะ submit หรือหมดเวลา
 if "expired_processed" not in st.session_state:
-    st.session_state["expired_processed"] = False  # กันเพิ่ม Z ซ้ำ
+    st.session_state["expired_processed"] = False  # กันเพิ่ม Z ซ้ำตอนหมดเวลา
+if "treated" not in st.session_state:
+    st.session_state["treated"] = False  # ผู้ป่วยได้รับการรักษาแล้ว
 
 # =========================
 # Helpers: Google Sheets client
@@ -400,7 +402,6 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
             const digits = document.getElementById('digits');
             const pg = document.getElementById('pg');
             const wrap = document.getElementById('timerWrap');
-
             function fmt(n) {{ return String(n).padStart(2,'0'); }}
             function render() {{
               let s = Math.max(0, Math.floor(remaining));
@@ -413,19 +414,10 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
                 pg.value = Math.min(origin, Math.max(0, origin - s));
               }}
             }}
-
             function hardReloadParent() {{
-              try {{
-                // 1) ขอให้ Streamlit rerun (บาง environment รองรับ)
-                window.parent.postMessage({{is_streamlit_message: true, type: "streamlit:rerun"}}, "*");
-              }} catch (e) {{}}
-              try {{
-                // 2) บังคับ reload ทั้งหน้า (ไม่ใช่แค่ iframe)
-                const p = window.parent || window.top || window;
-                p.location.reload();
-              }} catch (e) {{}}
+              try {{ window.parent.postMessage({{is_streamlit_message: true, type: "streamlit:rerun"}}, "*"); }} catch (e) {{}}
+              try {{ (window.parent || window.top || window).location.reload(); }} catch (e) {{}}
             }}
-
             render();
             const intv = setInterval(() => {{
               remaining -= 1;
@@ -433,8 +425,8 @@ def render_countdown(origin_seconds: int, remaining: int, paused: bool = False):
                 remaining = 0;
                 render();
                 clearInterval(intv);
-                if (wrap) wrap.style.display = 'none'; // ซ่อนกล่องทันที
-                setTimeout(hardReloadParent, 50);       // รีเฟรชทั้งหน้า
+                if (wrap) wrap.style.display = 'none';
+                setTimeout(hardReloadParent, 50);
                 return;
               }}
               render();
@@ -519,7 +511,7 @@ now = int(pd.Timestamp.utcnow().timestamp())
 remaining = max(0, end_epoch - now) if end_epoch else 0
 
 # ===== หมดเวลา → เพิ่ม Z + ล็อก + rerun (ให้รอบถัดไป lock ทั้งหน้าและเอาปุ่มออก) =====
-if (remaining <= 0) and (not st.session_state["expired_processed"]):
+if (remaining <= 0) and (not st.session_state["expired_processed"]) and (not st.session_state["treated"]):
     try:
         increment_Z(ws, sheet_row)
     except Exception as e:
@@ -528,17 +520,23 @@ if (remaining <= 0) and (not st.session_state["expired_processed"]):
     st.session_state["timer_stopped"] = True
     st.rerun()
 
-# ===== สถานะล็อก =====
-locked = (remaining <= 0) or st.session_state["expired_processed"] or st.session_state["timer_stopped"]
+# ===== สถานะล็อก (หมดเวลา/รักษาแล้ว/กดหยุด) =====
+expired = (remaining <= 0) or st.session_state["expired_processed"]
+treated = st.session_state["treated"]
+locked  = expired or treated or st.session_state["timer_stopped"]
 
 # ===== แสดง/ซ่อนตัวจับเวลา =====
 if not locked:
     render_countdown(origin_seconds, remaining, paused=False)
 
-# ===== ถ้าล็อก ให้ขึ้น Overlay + ข้อความ =====
+# ===== ข้อความและ Overlay ตามสถานะ =====
 if locked:
-    show_lock_overlay("คนไข้เสียชีวิตแล้ว")
-    st.error("คนไข้เสียชีวิตแล้ว")
+    if treated:
+        show_lock_overlay("คนไข้ได้รับการรักษาแล้ว")
+        st.success("คนไข้ได้รับการรักษาแล้ว")
+    else:
+        show_lock_overlay("คนไข้เสียชีวิตแล้ว")
+        st.error("คนไข้เสียชีวิตแล้ว")
 
 # ---------------- Defaults (กัน NameError) ----------------
 df_AK = None
@@ -580,12 +578,13 @@ if mode == "view":
 if mode == "view":
     if df_AC_RV is not None:
         render_kv_grid(df_AC_RV, title="Patient", cols=2)
-    if st.session_state["expired_processed"]:
+    if treated:
+        st.success("คนไข้ได้รับการรักษาแล้ว")
+    elif st.session_state["expired_processed"]:
         st.error("คนไข้เสียชีวิตแล้ว")
     else:
         st.success("Triage completed")
-    # ไม่ต้องมีปุ่ม Triage again ตอนถูกล็อก
-    if not locked and st.button("Triage again"):
+    if (not locked) and st.button("Triage again"):
         st.session_state["next_after_lq"] = None
         set_query_params(row=str(display_row), mode="edit1")
         st.rerun()
@@ -612,6 +611,7 @@ elif mode == "edit2" and not has_inline_phase2:
                         gas_stop_timer(display_row)  # ถ้ามี endpoint
                     except Exception:
                         pass
+                    st.session_state["treated"] = True
                     st.session_state["timer_stopped"] = True
                     st.toast("⏸ Timer Stopped")
                     set_query_params(row=str(display_row), mode="view")
@@ -688,6 +688,7 @@ else:
                             gas_stop_timer(display_row)
                         except Exception:
                             pass
+                        st.session_state["treated"] = True
                         st.session_state["timer_stopped"] = True
                         st.toast("⏸ Timer Stopped")
                         st.session_state["next_after_lq"] = None
